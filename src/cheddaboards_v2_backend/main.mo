@@ -216,6 +216,10 @@ persistent actor CheddaBoards {
   private var deleteRateLimitEntries : [(Principal, [DeletionAttempt])] = [];
   private var apiKeysStable : [(Text, ApiKey)] = [];
   private var developerTiersStable : [(Principal, DeveloperTier)] = [];
+  // Release A (Oct 2026): engine tag per game + optional developer contact email.
+  private var gameEnginesStable : [(Text, Text)] = [];
+  private var developerContactsStable : [(Principal, Text)] = [];
+  private var gameWebsitesStable : [(Text, Text)] = [];
   // Scoreboard stable storage
   private var scoreboardConfigsStable : [(Text, ScoreboardConfig)] = [];
   private var scoreboardEntriesStable : [(Text, [ScoreEntry])] = [];
@@ -266,6 +270,9 @@ persistent actor CheddaBoards {
   private transient var principalToSessionEntries : [(Text, Text)] = [];
   private transient var principalToSession = HashMap.HashMap<Text, Text>(10, Text.equal, Text.hash);
   private transient var developerTiers = HashMap.HashMap<Principal, DeveloperTier>(10, Principal.equal, Principal.hash);
+  private transient var gameEngines = HashMap.HashMap<Text, Text>(50, Text.equal, Text.hash);
+  private transient var developerContacts = HashMap.HashMap<Principal, Text>(10, Principal.equal, Principal.hash);
+  private transient var gameWebsites = HashMap.HashMap<Text, Text>(50, Text.equal, Text.hash);
   
   // Scoreboard runtime maps
   private transient var scoreboardConfigs = HashMap.HashMap<Text, ScoreboardConfig>(50, Text.equal, Text.hash);
@@ -291,7 +298,7 @@ persistent actor CheddaBoards {
   // 30 days (was 24h). Sessions also renew on every successful use — see validateSessionInternal.
   private transient let SESSION_DURATION_NS : Nat64 = 30 * 24 * 60 * 60 * 1_000_000_000;
   private transient var lastCleanup : Nat64 = 0;
-  private transient let MAX_GAMES_PER_DEVELOPER : Nat = 3;
+  private transient let _MAX_GAMES_PER_DEVELOPER : Nat = 3;  // superseded by getMaxGamesForDeveloper (tiers)
   private var adminRolesStable : [(Principal, AdminRole)] = [];
   private var auditLogStable : [AdminAction] = [];
   private var deletedUsersStable : [(Text, DeletedUser)] = [];
@@ -323,6 +330,10 @@ persistent actor CheddaBoards {
 
   private transient let DEFAULT_SESSION_DURATION_MINS : Nat = 30;
   private transient let MAX_ACTIVE_SESSIONS_PER_PLAYER : Nat = 3;  // Prevent token hoarding
+  // Global play-session sweep kicks in once the map passes this size. Per-player
+  // cleanup only runs when that player starts another session, so sessions from
+  // one-off players lingered forever (1,290 on fdvph, 30 Sep 2026).
+  private transient let PLAY_SESSION_SWEEP_THRESHOLD : Nat = 500;
 
   // ════════════════════════════════════════════════════════════════════════════
   // HELPERS
@@ -741,6 +752,21 @@ private func getDeveloperTierText(owner: Principal) : Text {
     for (key in keysToRemove.vals()) {
       playSessions.delete(key);
     };
+  };
+
+  // Drops every expired/inactive play session, but only when the map has grown
+  // past PLAY_SESSION_SWEEP_THRESHOLD, so the full scan is rare. Same rule as
+  // the admin cleanupAllExpiredPlaySessions(), just triggered by traffic.
+  private func sweepExpiredPlaySessionsIfLarge() {
+    if (playSessions.size() <= PLAY_SESSION_SWEEP_THRESHOLD) { return };
+    let currentTime = now();
+    let keysToRemove = Buffer.Buffer<Text>(50);
+    for ((token, session) in playSessions.entries()) {
+      if (currentTime >= session.expiresAt or not session.isActive) {
+        keysToRemove.add(token);
+      };
+    };
+    for (key in keysToRemove.vals()) { playSessions.delete(key) };
   };
 
   private func validatePlaySession(
@@ -2595,6 +2621,9 @@ private func repairMigratedStreaksInternal(dryRun : Bool) : Text {
     deleteRateLimitEntries := Iter.toArray(deleteRateLimit.entries());
     apiKeysStable := Iter.toArray(apiKeys.entries());
     developerTiersStable := Iter.toArray(developerTiers.entries());
+    gameEnginesStable := Iter.toArray(gameEngines.entries());
+    developerContactsStable := Iter.toArray(developerContacts.entries());
+    gameWebsitesStable := Iter.toArray(gameWebsites.entries());
     
     // Scoreboards - save to V2, DO NOT clear old ones
     scoreboardConfigsStableV2 := Iter.toArray(scoreboardConfigs.entries());
@@ -2845,6 +2874,9 @@ system func postupgrade() {
     developerTiers := HashMap.fromIter<Principal, DeveloperTier>(
         developerTiersStable.vals(), 10, Principal.equal, Principal.hash
     );
+    gameEngines := HashMap.fromIter<Text, Text>(gameEnginesStable.vals(), 50, Text.equal, Text.hash);
+    developerContacts := HashMap.fromIter<Principal, Text>(developerContactsStable.vals(), 10, Principal.equal, Principal.hash);
+    gameWebsites := HashMap.fromIter<Text, Text>(gameWebsitesStable.vals(), 50, Text.equal, Text.hash);
     
     // Restore scoreboard configs - prefer V2, fallback to old
     let configSource = if (scoreboardConfigsStableV2.size() > 0) { 
@@ -2974,6 +3006,7 @@ system func postupgrade() {
     status : Text;
     cycles : Nat;
     heapBytes : Nat;
+    maxLiveBytes : Nat;
     memoryBytes : Nat;
     users : Nat;
     games : Nat;
@@ -2999,6 +3032,7 @@ system func postupgrade() {
       status = if (cycles < CYCLES_WARN or memoryBytes > MEMORY_WARN) "warn" else "ok";
       cycles = cycles;
       heapBytes = Prim.rts_heap_size();
+      maxLiveBytes = Prim.rts_max_live_size();
       memoryBytes = memoryBytes;
       users = usersByEmail.size() + usersByPrincipal.size();
       games = games.size();
@@ -3026,6 +3060,7 @@ system func postupgrade() {
     "{\"status\":\"" # m.status # "\","
       # f("cycles", m.cycles) # ","
       # f("heapBytes", m.heapBytes) # ","
+      # f("maxLiveBytes", m.maxLiveBytes) # ","
       # f("memoryBytes", m.memoryBytes) # ","
       # f("users", m.users) # ","
       # f("games", m.games) # ","
@@ -3051,6 +3086,7 @@ system func postupgrade() {
     status : Text;
     cycles : Nat;
     heapBytes : Nat;
+    maxLiveBytes : Nat;
     memoryBytes : Nat;
     users : Nat;
     games : Nat;
@@ -3262,6 +3298,37 @@ system func postupgrade() {
     out
   };
 
+  // ── Game URL validation (release A, 30 Sep 2026) ──
+  // players.html renders gameUrl as a public link and updateGame feeds it into
+  // alternativeOrigins, so it's rejected (not clamped) when it isn't a plain
+  // https:// URL. Empty/whitespace becomes null so "clear the field" works.
+  private transient let MAX_GAME_URL_LENGTH : Nat = 200;
+
+  private func sanitizeGameUrl(url : ?Text) : Result.Result<?Text, Text> {
+    switch (url) {
+      case null { #ok(null) };
+      case (?raw) {
+        let u = Text.trim(raw, #predicate(func(c : Char) : Bool { c == ' ' or c == '\t' or c == '\n' or c == '\r' }));
+        if (Text.size(u) == 0) { return #ok(null) };
+        if (not Text.startsWith(u, #text "https://")) {
+          return #err("Game URL must start with https://");
+        };
+        if (Text.size(u) > MAX_GAME_URL_LENGTH) {
+          return #err("Game URL too long (max " # Nat.toText(MAX_GAME_URL_LENGTH) # " characters)");
+        };
+        if (Text.size(u) <= 8) {
+          return #err("Game URL is missing a host");
+        };
+        for (c in u.chars()) {
+          if (c == ' ' or c == '\"' or c == '\'' or c == '<' or c == '>' or c == '\\' or Char.toNat32(c) < 32) {
+            return #err("Game URL contains invalid characters");
+          };
+        };
+        #ok(?u)
+      };
+    }
+  };
+
 public shared(msg) func registerGame(
     gameId: Text, 
     name: Text, 
@@ -3270,9 +3337,13 @@ public shared(msg) func registerGame(
     maxStreakDelta: ?Nat64,
     absoluteScoreCap: ?Nat64,
     absoluteStreakCap: ?Nat64,
-    gameUrl: ?Text,
+    gameUrlRaw: ?Text,
     accessMode: ?AccessMode
   ) : async Result.Result<Text, Text> {
+    let gameUrl : ?Text = switch (sanitizeGameUrl(gameUrlRaw)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(u)) { u };
+    };
     
     if (Principal.isAnonymous(msg.caller)) {
       return #err("❌ Must authenticate with Internet Identity to register a game");
@@ -3299,9 +3370,10 @@ public shared(msg) func registerGame(
         };
         
         let currentGameCount = countGamesByOwner(msg.caller);
+        let maxGames = getMaxGamesForDeveloper(msg.caller);
         
-        if (currentGameCount >= MAX_GAMES_PER_DEVELOPER and not isAdmin(msg.caller)) {
-          return #err("🚫 Maximum " # Nat.toText(MAX_GAMES_PER_DEVELOPER) # " games per developer. You currently have " # Nat.toText(currentGameCount) # " games registered.");
+        if (currentGameCount >= maxGames and not isAdmin(msg.caller)) {
+          return #err("🚫 Maximum " # Nat.toText(maxGames) # " games per developer. You currently have " # Nat.toText(currentGameCount) # " games registered.");
         };
         
         let gameInfo : GameInfo = {
@@ -3351,7 +3423,7 @@ public shared(msg) func registerGame(
           ("total_games", Nat.toText(currentGameCount + 1))
         ]);
         
-        #ok("✅ Game '" # name # "' registered successfully! (" # Nat.toText(currentGameCount + 1) # "/" # Nat.toText(MAX_GAMES_PER_DEVELOPER) # " games) Default scoreboards created: all-time, weekly")
+        #ok("✅ Game '" # name # "' registered successfully! (" # Nat.toText(currentGameCount + 1) # "/" # Nat.toText(maxGames) # " games) Default scoreboards created: all-time, weekly")
       };
     }
   };
@@ -3360,8 +3432,12 @@ public shared(msg) func registerGame(
     gameId : Text, 
     name : Text, 
     description : Text,
-    gameUrl : ?Text
+    gameUrlRaw : ?Text
   ) : async Result.Result<Text, Text> {
+    let gameUrl : ?Text = switch (sanitizeGameUrl(gameUrlRaw)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(u)) { u };
+    };
     switch (games.get(gameId)) {
       case (?game) {
         if (game.owner != msg.caller and not isAdmin(msg.caller)) {
@@ -3955,9 +4031,12 @@ public shared(msg) func registerGame(
     maxStreakDelta: ?Nat64,
     absoluteScoreCap: ?Nat64,
     absoluteStreakCap: ?Nat64,
-    gameUrl: ?Text
+    gameUrlRaw: ?Text
   ) : async Result.Result<Text, Text> {
-    
+    let gameUrl : ?Text = switch (sanitizeGameUrl(gameUrlRaw)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(u)) { u };
+    };
     switch (getOwnerFromSession(sessionId)) {
       case (#err(e)) { return #err(e) };
       case (#ok(owner)) {
@@ -4030,9 +4109,12 @@ public shared(msg) func registerGame(
     gameId: Text,
     name: Text,
     description: Text,
-    gameUrl: ?Text
+    gameUrlRaw: ?Text
   ) : async Result.Result<Text, Text> {
-    
+    let gameUrl : ?Text = switch (sanitizeGameUrl(gameUrlRaw)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(u)) { u };
+    };
     switch (getOwnerFromSession(sessionId)) {
       case (#err(e)) { return #err(e) };
       case (#ok(owner)) {
@@ -4388,6 +4470,158 @@ public shared(msg) func registerGame(
     countGamesByOwner(msg.caller)
   };
 
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // ENGINE TAG (release A) — standalone map, not a GameInfo change.
+  // Values are a fixed set of lowercase slugs so the dashboard dropdown and any
+  // public listing agree. Safe to expose publicly.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  private transient let VALID_ENGINES : [Text] = ["godot4", "godot3", "unity", "rest", "other"];
+
+  private func isValidEngine(engine : Text) : Bool {
+    for (e in VALID_ENGINES.vals()) { if (e == engine) { return true } };
+    false
+  };
+
+  // "" clears the tag. Owner or admin only.
+  private func setGameEngineInternal(caller : Principal, gameId : Text, engine : Text) : Result.Result<Text, Text> {
+    switch (games.get(gameId)) {
+      case null { #err("Game not found") };
+      case (?game) {
+        if (not Principal.equal(game.owner, caller) and not isAdmin(caller)) {
+          return #err("Only game owner can set the engine");
+        };
+        if (engine == "") {
+          gameEngines.delete(gameId);
+          return #ok("Engine cleared");
+        };
+        if (not isValidEngine(engine)) {
+          return #err("Unknown engine. Use one of: godot4, godot3, unity, rest, other");
+        };
+        gameEngines.put(gameId, engine);
+        #ok("Engine set to " # engine)
+      };
+    }
+  };
+
+  public shared(msg) func setGameEngine(gameId : Text, engine : Text) : async Result.Result<Text, Text> {
+    if (Principal.isAnonymous(msg.caller)) { return #err("Anonymous callers cannot set engine") };
+    setGameEngineInternal(msg.caller, gameId, engine)
+  };
+
+  public shared func setGameEngineBySession(sessionId : Text, gameId : Text, engine : Text) : async Result.Result<Text, Text> {
+    switch (getOwnerFromSession(sessionId)) {
+      case (#err(e)) { #err(e) };
+      case (#ok(owner)) { setGameEngineInternal(owner, gameId, engine) };
+    }
+  };
+
+  public query func getGameEngine(gameId : Text) : async ?Text {
+    gameEngines.get(gameId)
+  };
+
+  // All tags at once, for the dashboard/players cards.
+  public query func getGameEngines() : async [(Text, Text)] {
+    Iter.toArray(gameEngines.entries())
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // WEBSITE URL (release A) — optional, gameId -> https URL. Separate from
+  // gameUrl, which is the PLAY link; several devs had put their site there.
+  // Same standalone-map pattern as the engine tag. Safe to expose publicly.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  // "" clears it. Owner or admin only. Validated like gameUrl.
+  private func setGameWebsiteInternal(caller : Principal, gameId : Text, website : Text) : Result.Result<Text, Text> {
+    switch (games.get(gameId)) {
+      case null { #err("Game not found") };
+      case (?game) {
+        if (not Principal.equal(game.owner, caller) and not isAdmin(caller)) {
+          return #err("Only game owner can set the website");
+        };
+        switch (sanitizeGameUrl(?website)) {
+          case (#err(e)) { #err(e) };
+          case (#ok(null)) { gameWebsites.delete(gameId); #ok("Website cleared") };
+          case (#ok(?u)) { gameWebsites.put(gameId, u); #ok("Website set") };
+        }
+      };
+    }
+  };
+
+  public shared(msg) func setGameWebsite(gameId : Text, website : Text) : async Result.Result<Text, Text> {
+    if (Principal.isAnonymous(msg.caller)) { return #err("Anonymous callers cannot set website") };
+    setGameWebsiteInternal(msg.caller, gameId, website)
+  };
+
+  public shared func setGameWebsiteBySession(sessionId : Text, gameId : Text, website : Text) : async Result.Result<Text, Text> {
+    switch (getOwnerFromSession(sessionId)) {
+      case (#err(e)) { #err(e) };
+      case (#ok(owner)) { setGameWebsiteInternal(owner, gameId, website) };
+    }
+  };
+
+  public query func getGameWebsite(gameId : Text) : async ?Text {
+    gameWebsites.get(gameId)
+  };
+
+  public query func getGameWebsites() : async [(Text, Text)] {
+    Iter.toArray(gameWebsites.entries())
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // DEVELOPER CONTACT EMAIL (release A) — optional, principal -> email.
+  // Never exposed publicly: getGame is public, so this lives in its own map with
+  // owner/admin getters only. Feeds Request-More-Slots.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  private transient let MAX_CONTACT_EMAIL_LENGTH : Nat = 254;
+
+  // "" clears the contact.
+  private func setDeveloperContactInternal(owner : Principal, email : Text) : Result.Result<Text, Text> {
+    let e = Text.trim(email, #predicate(func(c : Char) : Bool { c == ' ' or c == '\t' or c == '\n' or c == '\r' }));
+    if (Text.size(e) == 0) {
+      developerContacts.delete(owner);
+      return #ok("Contact email cleared");
+    };
+    if (Text.size(e) > MAX_CONTACT_EMAIL_LENGTH) {
+      return #err("Contact email too long");
+    };
+    if (not looksLikeEmail(e)) {
+      return #err("Contact email doesn't look like an email address");
+    };
+    developerContacts.put(owner, e);
+    #ok("Contact email saved")
+  };
+
+  public shared(msg) func setDeveloperContact(email : Text) : async Result.Result<Text, Text> {
+    if (Principal.isAnonymous(msg.caller)) { return #err("Anonymous callers cannot set a contact email") };
+    setDeveloperContactInternal(msg.caller, email)
+  };
+
+  public shared func setDeveloperContactBySession(sessionId : Text, email : Text) : async Result.Result<Text, Text> {
+    switch (getOwnerFromSession(sessionId)) {
+      case (#err(e)) { #err(e) };
+      case (#ok(owner)) { setDeveloperContactInternal(owner, email) };
+    }
+  };
+
+  public shared query(msg) func getMyDeveloperContact() : async ?Text {
+    developerContacts.get(msg.caller)
+  };
+
+  public query func getMyDeveloperContactBySession(sessionId : Text) : async Result.Result<?Text, Text> {
+    switch (getOwnerFromSession(sessionId)) {
+      case (#err(e)) { #err(e) };
+      case (#ok(owner)) { #ok(developerContacts.get(owner)) };
+    }
+  };
+
+  // Admin: look up a developer's contact (e.g. when handling a slots request).
+  public shared query(msg) func getDeveloperContact(owner : Principal) : async Result.Result<?Text, Text> {
+    if (not isAdmin(msg.caller)) { return #err("Admin only") };
+    #ok(developerContacts.get(owner))
+  };
 
   public query func getGame(gameId : Text) : async ?GameInfo {
     games.get(gameId)
@@ -5669,7 +5903,7 @@ public shared func revokeApiKeyBySession(
         if (timeRules.enabled) {
           switch (playSessionToken) {
             case null {
-              return #err("This game requires starting a session before submitting. Call startGameSession first.");
+              return #err("This game has time validation on. Start a play session first (SDK: start_play_session(), REST: POST /play-sessions/start) and send its token with the score.");
             };
             case (?token) {
               let validation = validatePlaySession(token, u.identifier, gameId, score);
@@ -6008,7 +6242,7 @@ public shared func revokeApiKeyBySession(
         if (timeRules.enabled) {
           switch (playSessionToken) {
             case null {
-              return #err("This game requires starting a session before submitting. Call startGameSession first.");
+              return #err("This game has time validation on. Start a play session first (SDK: start_play_session(), REST: POST /play-sessions/start) and send its token with the score.");
             };
             case (?token) {
               let validation = validatePlaySession(token, u.identifier, gameId, score);
@@ -6601,6 +6835,7 @@ public shared func revokeApiKeyBySession(
     let identifier : UserIdentifier = #principal(caller);
     
     cleanupExpiredPlaySessions(identifier, gameId);
+    sweepExpiredPlaySessionsIfLarge();
     
     let activeCount = countActiveSessionsForPlayer(identifier, gameId);
     if (activeCount >= MAX_ACTIVE_SESSIONS_PER_PLAYER) {
@@ -6651,6 +6886,7 @@ public shared func revokeApiKeyBySession(
     };
     
     cleanupExpiredPlaySessions(identifier, gameId);
+    sweepExpiredPlaySessionsIfLarge();
     
     let activeCount = countActiveSessionsForPlayer(identifier, gameId);
     if (activeCount >= MAX_ACTIVE_SESSIONS_PER_PLAYER) {
@@ -6724,6 +6960,7 @@ public shared func revokeApiKeyBySession(
     let identifier : UserIdentifier = #email("ext:" # playerId);
     
     cleanupExpiredPlaySessions(identifier, gameId);
+    sweepExpiredPlaySessionsIfLarge();
     
     let activeCount = countActiveSessionsForPlayer(identifier, gameId);
     if (activeCount >= MAX_ACTIVE_SESSIONS_PER_PLAYER) {
@@ -7645,263 +7882,6 @@ public shared func revokeApiKeyBySession(
   };
 
   // ═══════════════════════════════════════════════════════════════════════════════
-  // SUBMIT SCORE TO SCOREBOARD
-  // ═══════════════════════════════════════════════════════════════════════════════
-
-  public shared(msg) func submitScoreToScoreboard(
-    userIdType : Text,
-    userId : Text,
-    gameId : Text,
-    scoreboardId : Text,
-    scoreNat : Nat,
-    streakNat : Nat,
-    nickname : ?Text
-  ) : async Result.Result<{ rank : Nat; isNewBest : Bool }, Text> {
-    
-    let key = makeScoreboardKey(gameId, scoreboardId);
-    
-    // Validate caller
-    switch (validateCaller(msg, userIdType, userId)) {
-      case (#err(e)) { return #err(e) };
-      case (#ok(_)) {};
-    };
-
-    // Build identifier
-    let identifier : UserIdentifier = switch (userIdType) {
-      case ("email") { 
-        switch (validateSessionInternal(userId)) {
-          case (#err(e)) { return #err(e) };
-          case (#ok(session)) { #email(session.email) };
-        };
-      };
-      case ("session") {
-        switch (validateSessionInternal(userId)) {
-          case (#err(e)) { return #err(e) };
-          case (#ok(session)) { #email(session.email) };
-        };
-      };
-      case ("principal") { #principal(msg.caller) };
-      case ("external") { #email("ext:" # userId) };
-      case (_) { return #err("Invalid user type") };
-    };
-
-    // Get scoreboard config
-    switch (scoreboardConfigs.get(key)) {
-      case null { return #err("Scoreboard not found") };
-      case (?config) {
-        if (not config.isActive) {
-          return #err("Scoreboard is not active");
-        };
-
-        // Check if scoreboard needs reset
-        if (scoreboardNeedsReset(config)) {
-          archiveAndClearScoreboard(key, config);
-        };
-
-        // Validate game exists
-        switch (games.get(gameId)) {
-          case null { return #err("Game not found") };
-          case (?game) {
-            if (not game.isActive) {
-              return #err("Game is not active");
-            };
-          };
-        };
-
-        let score = Nat64.fromNat(scoreNat);
-        let streak = Nat64.fromNat(streakNat);
-        let playerId = identifierToText(identifier);
-
-        // Validate score and streak
-        switch (validateScore(score, gameId)) {
-          case (#err(e)) { 
-            logSuspicion(playerId, gameId, "Invalid score submission: " # e);
-            return #err("Score rejected by game validation rules");
-          };
-          case (#ok()) {};
-        };
-
-        switch (validateStreak(streak, gameId)) {
-          case (#err(e)) { 
-            logSuspicion(playerId, gameId, "Invalid streak submission: " # e);
-            return #err("Streak rejected by game validation rules");
-          };
-          case (#ok()) {};
-        };
-
-        // Get user info
-        let user = getUserByIdentifier(identifier);
-        let playerNickname = switch (user) {
-          case (?u) { u.nickname };
-          case null {
-            switch (nickname) {
-              case (?n) { n };
-              case null { "Player" };
-            };
-          };
-        };
-
-        let authType = switch (user) {
-          case (?u) { u.authType };
-          case null { #external };
-        };
-
-        // Get or create entries buffer
-        let buffer = switch (scoreboardEntries.get(key)) {
-          case null { 
-            let newBuffer = Buffer.Buffer<ScoreEntry>(100);
-            scoreboardEntries.put(key, newBuffer);
-            newBuffer
-          };
-          case (?b) { b };
-        };
-
-        let currentTime = now();
-        
-        // Get the value we're comparing based on sortBy
-        let newValue = switch (config.sortBy) {
-          case (#score) { score };
-          case (#streak) { streak };
-        };
-
-        // Single O(n) pass: find existing entry AND count better scores
-        var existingIdx : ?Nat = null;
-        var existingEntry : ?ScoreEntry = null;
-        var betterCount : Nat = 0;
-        var idx : Nat = 0;
-        
-        for (entry in buffer.vals()) {
-          let entryValue = switch (config.sortBy) {
-            case (#score) { entry.score };
-            case (#streak) { entry.streak };
-          };
-          
-          if (identifierToText(entry.odentifier) == identifierToText(identifier)) {
-            existingIdx := ?idx;
-            existingEntry := ?entry;
-          } else {
-            // Count entries with better scores (for rank calculation)
-            if (entryValue > newValue) {
-              betterCount += 1;
-            };
-          };
-          idx += 1;
-        };
-
-        var isNewBest = false;
-        var finalValue = newValue;
-
-        switch (existingEntry) {
-          case (?existing) {
-            let existingValue = switch (config.sortBy) {
-              case (#score) { existing.score };
-              case (#streak) { existing.streak };
-            };
-            
-            // Update if better score
-            if (newValue > existingValue) {
-              let updated : ScoreEntry = {
-                odentifier = identifier;
-                nickname = playerNickname;
-                score = score;
-                streak = streak;
-                submittedAt = currentTime;
-                authType = authType;
-              };
-              
-              switch (existingIdx) {
-                case (?i) { buffer.put(i, updated) };
-                case null {};
-              };
-              isNewBest := true;
-              finalValue := newValue;
-            } else {
-              // Keep existing value for rank calculation
-              finalValue := existingValue;
-            };
-          };
-          case null {
-            // New entry
-            let newEntry : ScoreEntry = {
-              odentifier = identifier;
-              nickname = playerNickname;
-              score = score;
-              streak = streak;
-              submittedAt = currentTime;
-              authType = authType;
-            };
-            buffer.add(newEntry);
-            isNewBest := true;
-
-            // If over max entries, remove the worst - O(n)
-            if (buffer.size() > config.maxEntries) {
-              var worstIdx : Nat = 0;
-              var worstValue : Nat64 = switch (config.sortBy) {
-                case (#score) { buffer.get(0).score };
-                case (#streak) { buffer.get(0).streak };
-              };
-              
-              var i : Nat = 1;
-              while (i < buffer.size()) {
-                let entryValue = switch (config.sortBy) {
-                  case (#score) { buffer.get(i).score };
-                  case (#streak) { buffer.get(i).streak };
-                };
-                if (entryValue < worstValue) {
-                  worstValue := entryValue;
-                  worstIdx := i;
-                };
-                i += 1;
-              };
-              
-              // If we're removing ourselves (we're the worst), adjust rank
-              let newBuffer = Buffer.Buffer<ScoreEntry>(config.maxEntries);
-              i := 0;
-              for (entry in buffer.vals()) {
-                if (i != worstIdx) {
-                  newBuffer.add(entry);
-                };
-                i += 1;
-              };
-              scoreboardEntries.put(key, newBuffer);
-              
-              // If the worst entry was our new entry, we're not on the board
-              if (worstValue == newValue) {
-                return #ok({ rank = config.maxEntries + 1; isNewBest = false });
-              };
-            };
-          };
-        };
-
-        // Invalidate cache
-        cachedScoreboards.delete(key);
-
-        // Rank = count of entries better than us + 1
-        // For existing entries, recount with final value
-        if (Option.isSome(existingEntry) and not isNewBest) {
-          // Recount with existing value
-          betterCount := 0;
-          for (entry in buffer.vals()) {
-            if (identifierToText(entry.odentifier) != identifierToText(identifier)) {
-              let entryValue = switch (config.sortBy) {
-                case (#score) { entry.score };
-                case (#streak) { entry.streak };
-              };
-              if (entryValue > finalValue) {
-                betterCount += 1;
-              };
-            };
-          };
-        };
-        
-        let rank = betterCount + 1;
-
-        #ok({ rank = rank; isNewBest = isNewBest })
-      };
-    };
-  };
-
-  // ═══════════════════════════════════════════════════════════════════════════════
   // RESET SCOREBOARD (Developer function)
   // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -7987,9 +7967,11 @@ public shared func revokeApiKeyBySession(
             };
             scoreboardConfigs.put(key, updated);
             
-            // Clear entries
+            // Clear entries, read cache, and this board's archived periods
             scoreboardEntries.delete(key);
             cachedScoreboards.delete(key);
+            scoreboardLastUpdate.delete(key);
+            purgeScoreboardArchives(gameId, scoreboardId);
             
             trackEventInternal(#principal(owner), gameId, "scoreboard_deleted", [
               ("scoreboardId", scoreboardId)
@@ -8237,6 +8219,8 @@ public shared func revokeApiKeyBySession(
         scoreboardConfigs.put(key, updated);
         scoreboardEntries.delete(key);
         cachedScoreboards.delete(key);
+        scoreboardLastUpdate.delete(key);
+        purgeScoreboardArchives(gameId, scoreboardId);
 
         trackEventInternal(#principal(owner), gameId, "scoreboard_deleted", [
           ("scoreboardId", scoreboardId)
@@ -8837,14 +8821,14 @@ public shared func revokeApiKeyBySession(
           let removed = switch (userType) {
             case ("email") { 
               switch (usersByEmail.remove(userId)) {
-                case (?_) true;
+                case (?_) { ignore sweepSessionsForEmail(userId); true };
                 case null false;
               }
             };
             case ("external") {
               // External auth users (Google/Apple) stored with ext: prefix
               switch (usersByEmail.remove("ext:" # userId)) {
-                case (?_) true;
+                case (?_) { ignore sweepSessionsForEmail("ext:" # userId); true };
                 case null false;
               }
             };
@@ -10860,6 +10844,23 @@ private func emailToPrincipalSimple(email: Text) : Principal {
 // ═══════════════════════════════════════════════════════════════════════════════
 // HELPER: Validate session and get owner Principal
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/// Delete every login session held by this email (and any stale
+/// principalToSession pointer at it). Used by removeUser so a removed
+/// account can't keep acting through an open dashboard tab.
+private func sweepSessionsForEmail(email : Text) : Nat {
+    let toDelete = Buffer.Buffer<Text>(4);
+    for ((sessionId, session) in sessions.entries()) {
+        if (session.email == email) { toDelete.add(sessionId) };
+    };
+    for (sessionId in toDelete.vals()) { sessions.delete(sessionId) };
+    let stalePointers = Buffer.Buffer<Text>(2);
+    for ((p, sessionId) in principalToSession.entries()) {
+        if (Option.isNull(sessions.get(sessionId))) { stalePointers.add(p) };
+    };
+    for (p in stalePointers.vals()) { principalToSession.delete(p) };
+    toDelete.size()
+};
 
 private func getOwnerFromSession(sessionId: Text) : Result.Result<Principal, Text> {
     switch (sessions.get(sessionId)) {

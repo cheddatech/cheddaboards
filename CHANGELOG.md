@@ -4,6 +4,33 @@ This changelog starts on 2026-08-18. Earlier changes weren't tracked in this
 repo, so the first entry below is a catch-up covering everything since the
 previous public update. Per-release entries begin from here.
 
+## v0.12.0 — 2026-10-04
+
+### Added
+- Engine tag per game: `setGameEngine` / `setGameEngineBySession` (game owner only) and public queries `getGameEngine` / `getGameEngines`. Accepted values are `godot4`, `godot3`, `unity`, `rest` and `other`; an empty value clears the tag.
+- Website URL per game, separate from the play link in `gameUrl`: `setGameWebsite` / `setGameWebsiteBySession` (game owner only) and public queries `getGameWebsite` / `getGameWebsites`. Same validation as `gameUrl`; an empty value clears it.
+- Optional developer contact email: `setDeveloperContact` / `setDeveloperContactBySession`, readable by its owner through `getMyDeveloperContact` / `getMyDeveloperContactBySession` and by admins through `getDeveloperContact`. It is never exposed by a public query.
+- `maxLiveBytes` in `memStats` and `GET /metrics`: the largest live heap the runtime has seen.
+
+### Changed
+- `gameUrl` is now validated on all four write paths (both register and both update methods). It must start with `https://`, be at most 200 characters, and contain no spaces, quotes, angle brackets or control characters. Leading and trailing whitespace is trimmed and an empty value clears the URL. Invalid values are rejected with an error; values stored before this release are left as they are until the next edit.
+- Expired play sessions are now swept globally whenever the session map passes 500 entries. Previously a player's stale sessions were only cleared when that same player started another session, so one-off players left sessions behind indefinitely.
+- `registerGame` (principal path) now uses the developer's tier limit for game slots, matching `registerGameBySession`, instead of a flat limit.
+- The error returned when a game with time validation on receives a score without a play session now tells the caller what to do (SDK: `start_play_session()`, REST: `POST /play-sessions/start`) instead of naming an internal method.
+
+### Fixed
+- Deleting a scoreboard now also purges that board's archived periods, on both the principal and session paths. Previously the archives were left behind.
+- The admin `removeUser` command now also removes that user's login sessions.
+
+### Removed
+- `submitScoreToScoreboard`, the legacy targeted-submit method. `submitScoreToBoard` replaces it; the legacy method also never counted towards the submission total.
+
+### Notes for self-hosters
+- This release removes one Candid method, so dfx will prompt about a breaking interface change on upgrade and should name only `submitScoreToScoreboard`. Expected; confirm it. If your proxy or any client still calls that method, move it to `submitScoreToBoard` first.
+- Single deploy, no migration. The engine, website and contact maps are new stable fields, which EOP accepts on a normal upgrade.
+- If you parse the session-required error string, note the new wording.
+- Take a snapshot before upgrading and keep one at a time (`dfx canister snapshot create --replace`).
+
 ## v0.11.0 — 2026-09-30
 
 ### Removed
