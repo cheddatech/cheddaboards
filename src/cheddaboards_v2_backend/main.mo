@@ -1568,6 +1568,32 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
   // from BOTH the recovery map AND the live games map (the old version only
   // touched deletedGames and had an impossible `not canRecover` guard, so expired
   // games accumulated forever). Safe to call opportunistically from hot paths.
+  // HARDENING (Oct 2026): everything keyed by gameId that outlives the GameInfo
+  // record. Called when a game ID leaves the games map for good, and again when
+  // an ID is registered fresh, so a re-used ID never inherits the previous
+  // registration's API key, engine tag or website.
+  // NOT called on soft delete: the key has to survive a recovery inside the
+  // 30-day window, and an inactive game rejects submits anyway.
+  // Returns how many active keys were revoked.
+  private func purgeGameRemnants(gameId : Text) : Nat {
+    var revoked = 0;
+    label sweep loop {
+      switch (ApiKeys.revokeForGame(apiKeys, gameId)) {
+        case (?(key, revokedKey)) {
+          apiKeys.put(key, revokedKey);
+          revoked += 1;
+          // One active key per game is the rule; the cap is only a guard
+          // against a module change ever returning the same key twice.
+          if (revoked >= 20) { break sweep };
+        };
+        case null { break sweep };
+      };
+    };
+    gameEngines.delete(gameId);
+    gameWebsites.delete(gameId);
+    revoked
+  };
+
   func cleanupDeletedGames() {
     let nowT = Nat64.fromNat(Int.abs(Time.now()));
 
@@ -1582,6 +1608,7 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
     for (gameId in toRemove.vals()) {
       games.delete(gameId);        // remove the (inactive) record from the live map
       deletedGames.delete(gameId); // remove the recovery record
+      ignore purgeGameRemnants(gameId); // revoke its API key, clear engine/website
     };
   };
 
@@ -1751,6 +1778,7 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
         
         games.delete(gameId);
         deletedGames.delete(gameId);
+        ignore purgeGameRemnants(gameId);
         
         trackEventInternal(
           #principal(msg.caller),
@@ -1801,6 +1829,7 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
       if (nowTime > deleted.permanentDeletionAt) {
         games.delete(gameId);
         deletedGames.delete(gameId);
+        ignore purgeGameRemnants(gameId);
         cleaned.add(gameId);
         
         trackEventInternal(
@@ -3399,9 +3428,12 @@ public shared(msg) func registerGame(
           appleBundleId = null;
           appleTeamId = null;
         };
+        // A fresh registration starts clean: revoke any key (and clear any
+        // engine/website) left behind by an earlier game with this ID.
+        ignore purgeGameRemnants(gameId);
         games.put(gameId, gameInfo);
         
-        // Create default scoreboards (all-time and weekly)
+        // Create default scoreboards (all-time, weekly and daily)
         createDefaultScoreboards(gameId, msg.caller);
         
         switch(gameUrl) {
@@ -3423,7 +3455,7 @@ public shared(msg) func registerGame(
           ("total_games", Nat.toText(currentGameCount + 1))
         ]);
         
-        #ok("✅ Game '" # name # "' registered successfully! (" # Nat.toText(currentGameCount + 1) # "/" # Nat.toText(maxGames) # " games) Default scoreboards created: all-time, weekly")
+        #ok("✅ Game '" # name # "' registered successfully! (" # Nat.toText(currentGameCount + 1) # "/" # Nat.toText(maxGames) # " games) Default scoreboards created: all-time, weekly, daily")
       };
     }
   };
@@ -3939,7 +3971,7 @@ public shared(msg) func registerGame(
     googleConfigured : Bool;
     appleConfigured : Bool;
   }, Text> {
-    switch (sessions.get(sessionId)) {
+    switch (getValidSession(sessionId)) {
       case null { #err("Invalid session") };
       case (?session) {
         let owner = emailToPrincipalSimple(session.email);
@@ -4084,9 +4116,12 @@ public shared(msg) func registerGame(
           appleTeamId = null;
         };
         
+        // A fresh registration starts clean: revoke any key (and clear any
+        // engine/website) left behind by an earlier game with this ID.
+        ignore purgeGameRemnants(gameId);
         games.put(gameId, newGame);
         
-        // Create default scoreboards (all-time and weekly)
+        // Create default scoreboards (all-time, weekly and daily)
         createDefaultScoreboards(gameId, owner);
         
         trackEventInternal(#principal(owner), gameId, "game_registered", [
@@ -4094,7 +4129,7 @@ public shared(msg) func registerGame(
           ("game_id", gameId)
         ]);
         
-        #ok("Game '" # name # "' registered successfully! (" # Nat.toText(ownerGames + 1) # "/" # Nat.toText(maxGames) # " games) Default scoreboards created: all-time, weekly")
+        #ok("Game '" # name # "' registered successfully! (" # Nat.toText(ownerGames + 1) # "/" # Nat.toText(maxGames) # " games) Default scoreboards created: all-time, weekly, daily")
       };
     };
   };
@@ -4653,7 +4688,7 @@ public shared(msg) func registerGame(
   };
 
   public query func getDeveloperTierBySession(sessionId: Text) : async {tier: Text; maxGames: Nat; currentGames: Nat} {
-    switch (sessions.get(sessionId)) {
+    switch (getValidSession(sessionId)) {
         case null { {tier = "free"; maxGames = 3; currentGames = 0} };
         case (?session) {
             let owner = emailToPrincipalSimple(session.email);
@@ -4933,7 +4968,7 @@ public query func getScoreboardArchives(
 // ─────────────────────────────────────────────────────────────────────────────
 
 public query func getRemainingGameSlotsBySession(sessionId: Text) : async Nat {
-    switch (sessions.get(sessionId)) {
+    switch (getValidSession(sessionId)) {
         case null { return 0 };
         case (?session) {
             let owner = emailToPrincipalSimple(session.email);
@@ -5002,11 +5037,15 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
     ApiKeys.hasActiveKey(apiKeys, gameId)
   };
 
-  public query func validateApiKeyQuery(key : Text) : async ?{
+  // HARDENING (Oct 2026): verifier-only. This was a public oracle: anyone could
+  // test whether a guessed key was real and which game it belonged to. Only the
+  // proxy needs it. Same Candid signature, so no interface change.
+  public shared query(msg) func validateApiKeyQuery(key : Text) : async ?{
     gameId : Text;
     tier : Text;
     isActive : Bool;
   } {
+    if (not isVerifier(msg.caller)) { return null };
     ApiKeys.validate(apiKeys, key)
   };
 
@@ -5105,7 +5144,7 @@ public shared func generateApiKeyBySession(
 };
 
 public query func getApiKeyBySession(sessionId: Text, gameId: Text) : async Result.Result<Text, Text> {
-    switch (sessions.get(sessionId)) {
+    switch (getValidSession(sessionId)) {
         case null { return #err("Invalid session") };
         case (?session) {
             let owner = emailToPrincipalSimple(session.email);
@@ -5128,7 +5167,7 @@ public query func getApiKeyBySession(sessionId: Text, gameId: Text) : async Resu
 };
 
 public query func hasApiKeyBySession(sessionId: Text, gameId: Text) : async Bool {
-    switch (sessions.get(sessionId)) {
+    switch (getValidSession(sessionId)) {
         case null { return false };
         case (?session) {
             let owner = emailToPrincipalSimple(session.email);
@@ -5176,6 +5215,20 @@ public shared func revokeApiKeyBySession(
   // ════════════════════════════════════════════════════════════════════════════
   // AUTHENTICATION
   // ════════════════════════════════════════════════════════════════════════════
+
+  // HARDENING (Oct 2026): read-only session lookup for QUERY calls. Returns the
+  // session only if it exists and has not expired (same rule as
+  // validateSessionInternal). No renewal and no delete: a query can't persist
+  // either, and the next update call does both. Use this instead of a raw
+  // sessions.get in any query, which would accept an expired session.
+  private func getValidSession(sessionId : Text) : ?Session {
+    switch (sessions.get(sessionId)) {
+      case null { null };
+      case (?session) {
+        if (now() > session.expires) { null } else { ?session }
+      };
+    }
+  };
 
   func validateSessionInternal(sessionId : Text) : Result.Result<Session, Text> {
     switch (sessions.get(sessionId)) {
@@ -7140,7 +7193,7 @@ public shared func revokeApiKeyBySession(
     lastUsed: Nat64;
   } {
     if (not isVerifier(msg.caller)) { return null };
-    switch (sessions.get(sessionId)) {
+    switch (getValidSession(sessionId)) {
       case (?session) {
         ?{
           email = session.email;
@@ -7408,9 +7461,11 @@ public shared func revokeApiKeyBySession(
     };
   };
 
-  public query func getAchievements(userIdType : Text, userId : Text, gameId : Text) : async [Text] {
+  public shared query(msg) func getAchievements(userIdType : Text, userId : Text, gameId : Text) : async [Text] {
     let identifier : UserIdentifier = switch (userIdType) {
-      case ("email") { #email(userId) };
+      // HARDENING (Oct 2026): "email" is verifier-only, so a profile can't be
+      // looked up from a bare email address by a direct caller.
+      case ("email") { if (not isVerifier(msg.caller)) { return [] }; #email(userId) };
       case ("principal") { #principal(Principal.fromText(userId)) };
       case ("external") { #email("ext:" # userId) };
       case (_) { return [] };
@@ -8290,7 +8345,7 @@ public shared func revokeApiKeyBySession(
   // GET PLAYER RANK ON SCOREBOARD
   // ═══════════════════════════════════════════════════════════════════════════════
 
-  public query func getPlayerScoreboardRank(
+  public shared query(msg) func getPlayerScoreboardRank(
     gameId : Text,
     scoreboardId : Text,
     userIdType : Text,
@@ -8304,9 +8359,11 @@ public shared func revokeApiKeyBySession(
     let key = makeScoreboardKey(gameId, scoreboardId);
     
     let identifier : UserIdentifier = switch (userIdType) {
-      case ("email") { #email(userId) };
+      // HARDENING (Oct 2026): "email" is verifier-only, so a profile can't be
+      // looked up from a bare email address by a direct caller.
+      case ("email") { if (not isVerifier(msg.caller)) { return null }; #email(userId) };
       case ("session") { 
-        switch (sessions.get(userId)) {
+        switch (getValidSession(userId)) {
           case (?session) { #email(session.email) };
           case null { return null };
         };
@@ -8362,7 +8419,7 @@ public shared func revokeApiKeyBySession(
     };
   };
   
-  public query func getPlayerRank(
+  public shared query(msg) func getPlayerRank(
     gameId : Text,
     sortBy : SortBy,
     userIdType : Text,
@@ -8374,7 +8431,9 @@ public shared func revokeApiKeyBySession(
     totalPlayers : Nat;
   } {
     let identifier : UserIdentifier = switch (userIdType) {
-      case ("email") { #email(userId) };
+      // HARDENING (Oct 2026): "email" is verifier-only, so a profile can't be
+      // looked up from a bare email address by a direct caller.
+      case ("email") { if (not isVerifier(msg.caller)) { return null }; #email(userId) };
       case ("principal") { #principal(Principal.fromText(userId)) };
       case ("external") { #email("ext:" # userId) };
       case (_) { return null };
@@ -8490,7 +8549,8 @@ public shared func revokeApiKeyBySession(
 
   public query func getUserProfile(userIdType : Text, userId : Text) : async Result.Result<PublicUserProfile, Text> {
     let identifier : UserIdentifier = switch (userIdType) {
-      case ("email") { #email(userId) };
+      // HARDENING (Oct 2026): the "email" type is gone. It let anyone look up a
+      // profile from a bare email address. Use "session" or "external".
       case ("session") { 
         switch (validateSessionInternal(userId)) {
           case (#err(e)) { return #err(e) };
@@ -8516,14 +8576,16 @@ public shared func revokeApiKeyBySession(
     };
   };
 
-  public query func getGameProfile(
+  public shared query(msg) func getGameProfile(
     userIdType : Text, 
     userId : Text, 
     gameId : Text
   ) : async Result.Result<GameProfile, Text> {
     
     let identifier : UserIdentifier = switch (userIdType) {
-      case ("email") { #email(userId) };
+      // HARDENING (Oct 2026): "email" is verifier-only, so a profile can't be
+      // looked up from a bare email address by a direct caller.
+      case ("email") { if (not isVerifier(msg.caller)) { return #err("Invalid user type") }; #email(userId) };
       case ("session") {
         switch (validateSessionInternal(userId)) {
           case (#err(e)) { return #err(e) };
@@ -8616,9 +8678,11 @@ public shared func revokeApiKeyBySession(
     dailyStats.get(date # ":" # gameId)
   };
 
-  public query func getPlayerAnalytics(userIdType : Text, userId : Text, gameId : Text) : async ?PlayerStats {
+  public shared query(msg) func getPlayerAnalytics(userIdType : Text, userId : Text, gameId : Text) : async ?PlayerStats {
     let identifier : UserIdentifier = switch (userIdType) {
-      case ("email") { #email(userId) };
+      // HARDENING (Oct 2026): "email" is verifier-only, so a profile can't be
+      // looked up from a bare email address by a direct caller.
+      case ("email") { if (not isVerifier(msg.caller)) { return null }; #email(userId) };
       case ("principal") { #principal(Principal.fromText(userId)) };
       case ("external") { #email("ext:" # userId) };
       case (_) { return null };
@@ -10472,6 +10536,56 @@ case ("getDeveloperGames") {
     }
 };
 
+      // HARDENING (Oct 2026): one-off repair for keys orphaned before
+      // purgeGameRemnants existed. An orphan is an ACTIVE key whose gameId is no
+      // longer in the games map at all (soft-deleted games are still in the map,
+      // so their keys are left alone). No args = report only; "confirm" applies.
+      // Idempotent: a second confirmed run finds nothing.
+      case ("sweepOrphanApiKeys") {
+        if (not hasPermission(msg.caller, #SuperAdmin)) {
+          #err("🔒 Permission denied: SuperAdmin role required")
+        } else {
+          let apply = args.size() > 0 and args[0] == "confirm";
+          let orphans = Buffer.Buffer<(Text, ApiKey)>(0);
+          for ((keyText, k) in apiKeys.entries()) {
+            if (k.isActive and Option.isNull(games.get(k.gameId))) {
+              orphans.add((keyText, k));
+            };
+          };
+          var listing = "";
+          var shown = 0;
+          for ((keyText, k) in orphans.vals()) {
+            if (apply) {
+              apiKeys.put(keyText, { k with isActive = false });
+            };
+            // Game IDs only, never the key text.
+            if (shown < 100) { listing := listing # "  " # k.gameId # "\n"; shown += 1 };
+          };
+          let engineIds = Buffer.Buffer<Text>(0);
+          for ((gid, _) in gameEngines.entries()) {
+            if (Option.isNull(games.get(gid))) { engineIds.add(gid) };
+          };
+          let websiteIds = Buffer.Buffer<Text>(0);
+          for ((gid, _) in gameWebsites.entries()) {
+            if (Option.isNull(games.get(gid))) { websiteIds.add(gid) };
+          };
+          let staleEngines = engineIds.size();
+          let staleWebsites = websiteIds.size();
+          if (apply) {
+            for (gid in engineIds.vals()) { gameEngines.delete(gid) };
+            for (gid in websiteIds.vals()) { gameWebsites.delete(gid) };
+          };
+          #ok((if (apply) { "🧹 ORPHAN SWEEP APPLIED\n" } else { "🔍 ORPHAN SWEEP (report only, pass \"confirm\" to apply)\n" }) #
+              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
+              "Active keys with no game: " # Nat.toText(orphans.size()) # "\n" #
+              "Engine tags with no game: " # Nat.toText(staleEngines) # "\n" #
+              "Websites with no game: " # Nat.toText(staleWebsites) # "\n" #
+              "Total keys stored: " # Nat.toText(apiKeys.size()) # "\n" #
+              (if (orphans.size() > 0) { "Game IDs:\n" # listing } else { "" }) #
+              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        }
+      };
+
       case ("upgradeDeveloper") {
     if (not hasPermission(msg.caller, #SuperAdmin)) {
         #err("🔒 Permission denied: SuperAdmin role required")
@@ -10938,7 +11052,7 @@ private func isValidGameId(gameId: Text) : Bool {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 public query func getGamesBySession(sessionId: Text) : async [GameInfo] {
-    switch (sessions.get(sessionId)) {
+    switch (getValidSession(sessionId)) {
         case null { return [] };
         case (?session) {
             let owner = emailToPrincipalSimple(session.email);
@@ -10961,7 +11075,7 @@ public query func getSuspicionLogBySession(sessionId: Text, gameId: Text, limit:
     reason: Text;
     timestamp: Nat64;
   }] {
-    switch (sessions.get(sessionId)) {
+    switch (getValidSession(sessionId)) {
       case null { return [] };
       case (?session) {
         let owner = emailToPrincipalSimple(session.email);
@@ -11000,7 +11114,7 @@ public query func getSuspicionLogBySession(sessionId: Text, gameId: Text, limit:
 // ═══════════════════════════════════════════════════════════════════════════════
 
 public query func getDeletedGamesBySession(sessionId: Text) : async [DeletedGame] {
-    switch (sessions.get(sessionId)) {
+    switch (getValidSession(sessionId)) {
         case null { return [] };
         case (?session) {
             let owner = emailToPrincipalSimple(session.email);
@@ -11022,7 +11136,7 @@ public query func getDeletedGamesBySession(sessionId: Text) : async [DeletedGame
 // ═══════════════════════════════════════════════════════════════════════════════
 
 public query func getRemainingDeleteAttemptsBySession(sessionId: Text) : async Nat {
-    switch (sessions.get(sessionId)) {
+    switch (getValidSession(sessionId)) {
         case null { return 0 };
         case (?session) {
             let owner = emailToPrincipalSimple(session.email);

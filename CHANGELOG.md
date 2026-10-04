@@ -4,6 +4,27 @@ This changelog starts on 2026-08-18. Earlier changes weren't tracked in this
 repo, so the first entry below is a catch-up covering everything since the
 previous public update. Per-release entries begin from here.
 
+## v0.13.0 — 2026-10-04
+
+### Security — self-hosters should upgrade
+- A game's API key is now revoked when the game is permanently removed, and registering a game revokes any key left over from an earlier game with the same ID. Previously the key outlived the game, so a re-registered game ID inherited the previous registration's key. Soft-deleted games keep their key, so recovering a game inside the 30-day window restores a working key.
+- `validateApiKeyQuery` is now verifier-only. It was a public query that confirmed whether a key was real and which game it belonged to.
+- Profiles can no longer be looked up from a bare email address by a direct caller. `getUserProfile` no longer accepts the `email` type at all, and the `email` type on `getGameProfile`, `getPlayerScoreboardRank`, `getPlayerRank`, `getAchievements` and `getPlayerAnalytics` is verifier-only. The `session`, `principal` and `external` types are unchanged.
+- Session-token queries now reject expired sessions. `getGameOAuthConfigBySession`, `getDeveloperTierBySession`, `getRemainingGameSlotsBySession`, `getApiKeyBySession`, `hasApiKeyBySession`, `getSessionInfo`, `getGamesBySession`, `getSuspicionLogBySession`, `getDeletedGamesBySession`, `getRemainingDeleteAttemptsBySession` and the `session` type of `getPlayerScoreboardRank` previously read the session without checking its expiry.
+
+### Added
+- Admin command `sweepOrphanApiKeys` (super admin, via `adminGate`): reports active API keys, engine tags and websites whose game no longer exists. Pass `confirm` to revoke and clear them. Report-only by default, and safe to run more than once.
+
+### Changed
+- Permanently removing a game also clears its engine tag and website.
+- The registration success message now lists all three default scoreboards: `all-time`, `weekly`, `daily`.
+
+### Notes for self-hosters
+- No Candid interface changes and no migration: a single normal upgrade, with no dfx prompt expected.
+- Your proxy must make its **query** calls signed as the verifier identity too, not only its updates. A proxy that calls `validateApiKeyQuery` anonymously will see every API key as invalid after this upgrade.
+- After upgrading, run `adminGate("sweepOrphanApiKeys", [])` to see how many keys were left behind by deleted games, then again with `["confirm"]` to revoke them.
+- If your proxy looks players up with the `email` type on the queries above, it still works when signed as the verifier. Direct or anonymous callers must use `session` or `external`.
+
 ## v0.12.0 — 2026-10-04
 
 ### Added
