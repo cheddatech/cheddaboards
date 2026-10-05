@@ -4,6 +4,21 @@ This changelog starts on 2026-08-18. Earlier changes weren't tracked in this
 repo, so the first entry below is a catch-up covering everything since the
 previous public update. Per-release entries begin from here.
 
+## v0.14.0 — 2026-10-05
+
+### Security — self-hosters should upgrade
+- The developer identity behind dashboard (session) logins is now looked up by exact email, never derived from it. Previously the owner principal for a session-registered game was computed from the login email with a byte-fold that different emails could produce the same result for, so a verified login on a crafted address could have passed the owner checks on another developer's games: config, API keys, moderation and deletion. The hole has existed since session login was introduced; the collision report on the production canister after this upgrade found 0 colliding accounts, and there is no evidence it was ever exploited. Found through external code review of the public repo.
+- Existing accounts are seeded at upgrade with the principal they already own games, tiers and contacts under, so nothing changes for current developers. New accounts get a random principal from `raw_rand` on first login.
+
+### Added
+- Admin command `ownerIdReport` (super admin, via `adminGate`): shows whether the seed has run, how many accounts have an owner ID, how many are missing one, and any held collisions.
+- Admin command `resolveOwnerCollision <email> [confirm]`: if two existing accounts folded to the same principal at seed time, neither is assigned and both are held. The report names them; this command hands the legacy principal to the email you pick and releases the others to get fresh IDs on their next login. Report-only without `confirm`.
+
+### Notes for self-hosters
+- No Candid interface changes and no migration: a single normal upgrade. The new owner-ID map is a stable field, which EOP accepts. Pass `--wasm-memory-persistence keep` on the upgrade.
+- Run `adminGate("ownerIdReport", [])` straight after upgrading. Expect `Accounts without an ID: 0` and `Held collisions: 0`. A held account cannot use the dashboard until you resolve it; its calls return "Developer identity unavailable for this account".
+- Take a snapshot before upgrading and keep one at a time.
+
 ## v0.13.0 — 2026-10-04
 
 ### Security — self-hosters should upgrade

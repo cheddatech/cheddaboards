@@ -220,6 +220,10 @@ persistent actor CheddaBoards {
   private var gameEnginesStable : [(Text, Text)] = [];
   private var developerContactsStable : [(Principal, Text)] = [];
   private var gameWebsitesStable : [(Text, Text)] = [];
+  // v0.14.0: session-path developer identity, looked up by exact email.
+  private var emailOwnerIdsStable : [(Text, Principal)] = [];
+  private var ownerIdsSeeded : Bool = false;
+  private var ownerIdCollisions : [Text] = [];
   // Scoreboard stable storage
   private var scoreboardConfigsStable : [(Text, ScoreboardConfig)] = [];
   private var scoreboardEntriesStable : [(Text, [ScoreEntry])] = [];
@@ -273,6 +277,7 @@ persistent actor CheddaBoards {
   private transient var gameEngines = HashMap.HashMap<Text, Text>(50, Text.equal, Text.hash);
   private transient var developerContacts = HashMap.HashMap<Principal, Text>(10, Principal.equal, Principal.hash);
   private transient var gameWebsites = HashMap.HashMap<Text, Text>(50, Text.equal, Text.hash);
+  private transient var emailOwnerIds = HashMap.HashMap<Text, Principal>(100, Text.equal, Text.hash);
   
   // Scoreboard runtime maps
   private transient var scoreboardConfigs = HashMap.HashMap<Text, ScoreboardConfig>(50, Text.equal, Text.hash);
@@ -2653,6 +2658,7 @@ private func repairMigratedStreaksInternal(dryRun : Bool) : Text {
     gameEnginesStable := Iter.toArray(gameEngines.entries());
     developerContactsStable := Iter.toArray(developerContacts.entries());
     gameWebsitesStable := Iter.toArray(gameWebsites.entries());
+    emailOwnerIdsStable := Iter.toArray(emailOwnerIds.entries());
     
     // Scoreboards - save to V2, DO NOT clear old ones
     scoreboardConfigsStableV2 := Iter.toArray(scoreboardConfigs.entries());
@@ -2906,6 +2912,8 @@ system func postupgrade() {
     gameEngines := HashMap.fromIter<Text, Text>(gameEnginesStable.vals(), 50, Text.equal, Text.hash);
     developerContacts := HashMap.fromIter<Principal, Text>(developerContactsStable.vals(), 10, Principal.equal, Principal.hash);
     gameWebsites := HashMap.fromIter<Text, Text>(gameWebsitesStable.vals(), 50, Text.equal, Text.hash);
+    emailOwnerIds := HashMap.fromIter<Text, Principal>(emailOwnerIdsStable.vals(), 100, Text.equal, Text.hash);
+    seedOwnerIds(); // one-time; no-op once ownerIdsSeeded is set
     
     // Restore scoreboard configs - prefer V2, fallback to old
     let configSource = if (scoreboardConfigsStableV2.size() > 0) { 
@@ -3974,7 +3982,7 @@ public shared(msg) func registerGame(
     switch (getValidSession(sessionId)) {
       case null { #err("Invalid session") };
       case (?session) {
-        let owner = emailToPrincipalSimple(session.email);
+        let owner = ownerIdOrNobody(session.email);
         
         switch (games.get(gameId)) {
           case null { #err("Game not found") };
@@ -4691,7 +4699,7 @@ public shared(msg) func registerGame(
     switch (getValidSession(sessionId)) {
         case null { {tier = "free"; maxGames = 3; currentGames = 0} };
         case (?session) {
-            let owner = emailToPrincipalSimple(session.email);
+            let owner = ownerIdOrNobody(session.email);
             let maxGames = getMaxGamesForDeveloper(owner);
             let currentGames = getGameCountByOwner(owner);
             let tier = getDeveloperTierText(owner);
@@ -4971,7 +4979,7 @@ public query func getRemainingGameSlotsBySession(sessionId: Text) : async Nat {
     switch (getValidSession(sessionId)) {
         case null { return 0 };
         case (?session) {
-            let owner = emailToPrincipalSimple(session.email);
+            let owner = ownerIdOrNobody(session.email);
             let maxGames = getMaxGamesForDeveloper(owner);
             let count = getGameCountByOwner(owner);
             if (count >= maxGames) { 0 } else { maxGames - count }
@@ -5147,7 +5155,7 @@ public query func getApiKeyBySession(sessionId: Text, gameId: Text) : async Resu
     switch (getValidSession(sessionId)) {
         case null { return #err("Invalid session") };
         case (?session) {
-            let owner = emailToPrincipalSimple(session.email);
+            let owner = ownerIdOrNobody(session.email);
             
             switch (games.get(gameId)) {
                 case null { return #err("Game not found") };
@@ -5170,7 +5178,7 @@ public query func hasApiKeyBySession(sessionId: Text, gameId: Text) : async Bool
     switch (getValidSession(sessionId)) {
         case null { return false };
         case (?session) {
-            let owner = emailToPrincipalSimple(session.email);
+            let owner = ownerIdOrNobody(session.email);
             
             switch (games.get(gameId)) {
                 case null { return false };
@@ -5445,6 +5453,7 @@ public shared func revokeApiKeyBySession(
       };
     };
     
+    await* ensureOwnerId(email);
     let sessionId = generateSessionId(await* takeRandomBytes(32));
     let session : Session = {
       sessionId = sessionId;
@@ -5545,6 +5554,7 @@ public shared func revokeApiKeyBySession(
       };
     };
 
+    await* ensureOwnerId(userEmail);
     let sessionToken : Text = generateSessionId(await* takeRandomBytes(32));
     let session : Session = {
       sessionId = sessionToken;
@@ -6396,7 +6406,10 @@ public shared func revokeApiKeyBySession(
         if (session.expires < currentTime) {
           return #err("Session expired");
         };
-        let owner = emailToPrincipalSimple(session.email);
+        let owner = switch (emailOwnerIds.get(session.email)) {
+          case (?p) { p };
+          case null { return #err(OWNER_ID_MISSING) };
+        };
         switch (games.get(gameId)) {
           case null { #err("Game not found") };
           case (?game) {
@@ -10586,6 +10599,62 @@ case ("getDeveloperGames") {
         }
       };
 
+      // v0.14.0 owner-ID report: how many accounts were seeded, and any emails
+      // held back because 2+ emails folded to the same legacy principal.
+      case ("ownerIdReport") {
+        if (not hasPermission(msg.caller, #SuperAdmin)) {
+          #err("🔒 Permission denied: SuperAdmin role required")
+        } else {
+          var accounts = 0;
+          var missing = 0;
+          for ((key, _) in usersByEmail.entries()) {
+            if (not Text.startsWith(key, #text "ext:")) {
+              accounts += 1;
+              if (Option.isNull(emailOwnerIds.get(key))) { missing += 1 };
+            };
+          };
+          var listing = "";
+          for (e in ownerIdCollisions.vals()) {
+            listing := listing # "  " # e # "  (legacy " # Principal.toText(emailToPrincipalSimple(e)) # ")\n";
+          };
+          #ok("🪪 OWNER ID REPORT\n" #
+              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
+              "Seeded: " # debug_show(ownerIdsSeeded) # "\n" #
+              "Owner IDs stored: " # Nat.toText(emailOwnerIds.size()) # "\n" #
+              "Non-anonymous accounts: " # Nat.toText(accounts) # "\n" #
+              "Accounts without an ID: " # Nat.toText(missing) # "\n" #
+              "Held collisions: " # Nat.toText(ownerIdCollisions.size()) # "\n" #
+              listing #
+              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        }
+      };
+
+      // Give a held email its legacy principal (the one its games are owned by).
+      // Every other email in the same collision group is released and gets a
+      // fresh random ID at its next login. Report-only unless "confirm".
+      case ("resolveOwnerCollision") {
+        if (not hasPermission(msg.caller, #SuperAdmin)) {
+          #err("🔒 Permission denied: SuperAdmin role required")
+        } else if (args.size() < 1) {
+          #err("Usage: resolveOwnerCollision <email> [confirm]")
+        } else if (not isOwnerIdCollision(args[0])) {
+          #err("Not a held collision: " # args[0])
+        } else {
+          let email = args[0];
+          let legacy = emailToPrincipalSimple(email);
+          let group = Array.filter<Text>(ownerIdCollisions, func(e) { Principal.equal(emailToPrincipalSimple(e), legacy) });
+          var owned = 0;
+          for ((_, g) in games.entries()) { if (Principal.equal(g.owner, legacy)) { owned += 1 } };
+          if (args.size() > 1 and args[1] == "confirm") {
+            emailOwnerIds.put(email, legacy);
+            ownerIdCollisions := Array.filter<Text>(ownerIdCollisions, func(e) { not Principal.equal(emailToPrincipalSimple(e), legacy) });
+            #ok("✅ " # email # " now holds " # Principal.toText(legacy) # " (" # Nat.toText(owned) # " games). Released " # Nat.toText(group.size() - 1) # " other email(s).")
+          } else {
+            #ok("🔍 " # email # " would get " # Principal.toText(legacy) # " (" # Nat.toText(owned) # " games). Group size " # Nat.toText(group.size()) # ". Pass \"confirm\" to apply.")
+          }
+        }
+      };
+
       case ("upgradeDeveloper") {
     if (not hasPermission(msg.caller, #SuperAdmin)) {
         #err("🔒 Permission denied: SuperAdmin role required")
@@ -10593,9 +10662,10 @@ case ("getDeveloperGames") {
         #err("Usage: upgradeDeveloper <email>")
     } else {
         let email = args[0];
-        let principal = emailToPrincipalSimple(email);
-        
-        developerTiers.put(principal, #pro);
+        switch (emailOwnerIds.get(email)) {
+          case null { return #err("No developer identity for " # email # " (they need to sign in once)") };
+          case (?principal) { developerTiers.put(principal, #pro) };
+        };
         #ok("⭐ DEVELOPER UPGRADED TO PRO\n" #
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
             "Email: " # email # "\n" #
@@ -10611,9 +10681,10 @@ case ("downgradeDeveloper") {
         #err("Usage: downgradeDeveloper <email>")
     } else {
         let email = args[0];
-        let principal = emailToPrincipalSimple(email);
-        
-        developerTiers.delete(principal);
+        switch (emailOwnerIds.get(email)) {
+          case null { return #err("No developer identity for " # email) };
+          case (?principal) { developerTiers.delete(principal) };
+        };
         #ok("Developer downgraded to free tier (3 games max)")
     }
 };
@@ -10770,9 +10841,11 @@ case ("downgradeDeveloper") {
                 case null {};
               };
 
-              // OAuth / session owner: reverse the email→principal hash by scanning keys
-              for ((key, user) in usersByEmail.entries()) {
-                if (Principal.equal(emailToPrincipalSimple(key), game.owner)) {
+              // OAuth / session owner: reverse lookup through the owner-ID map
+              for ((key, ownerId) in emailOwnerIds.entries()) {
+                switch (if (Principal.equal(ownerId, game.owner)) { usersByEmail.get(key) } else { null }) {
+                case null {};
+                case (?user) {
                   found := true;
                   let keyType = if (Text.startsWith(key, #text "ext:")) { "external" }
                                 else if (Text.startsWith(key, #text "dev_")) { "device" }
@@ -10782,6 +10855,7 @@ case ("downgradeDeveloper") {
                             "  Nickname: " # user.nickname # "\n" #
                             "  Auth: " # debug_show(user.authType) # "\n" #
                             "  Created: " # Nat64.toText(user.created) # "\n";
+                };
                 };
               };
 
@@ -10956,6 +11030,76 @@ private func emailToPrincipalSimple(email: Text) : Principal {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// DEVELOPER OWNER IDS (v0.14.0)
+// Session-path owner identity is LOOKED UP by exact email, never computed.
+// emailToPrincipalSimple is an XOR fold (trivially collidable), so it is now
+// only used once, to seed existing accounts with the principal they already
+// own games/tiers/contacts under. New accounts get a random principal at login.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Matches no game.owner: folds start 0x04, random IDs end 0x01, II ends 0x02.
+private func noOwner() : Principal {
+    Principal.fromBlob(Blob.fromArray([0x00 : Nat8, 0x7f]))
+};
+
+private func isOwnerIdCollision(email : Text) : Bool {
+    Option.isSome(Array.find<Text>(ownerIdCollisions, func(e) { e == email }))
+};
+
+/// For read-only query paths: an unknown email simply owns nothing.
+private func ownerIdOrNobody(email : Text) : Principal {
+    switch (emailOwnerIds.get(email)) {
+        case (?p) { p };
+        case null { noOwner() };
+    }
+};
+
+/// Called by the verifier-gated login paths before minting a session.
+/// Emails held as seeding collisions are left unassigned for admin review.
+private func ensureOwnerId(email : Text) : async* () {
+    if (Option.isSome(emailOwnerIds.get(email))) { return };
+    if (isOwnerIdCollision(email)) { return };
+    let bytes = await* takeRandomBytes(28);
+    if (Option.isSome(emailOwnerIds.get(email))) { return }; // concurrent login won
+    emailOwnerIds.put(email, Principal.fromBlob(Blob.fromArray(Array.append<Nat8>(bytes, [0x01]))));
+};
+
+/// One-time seed from existing accounts. Any fold shared by 2+ emails is NOT
+/// seeded for any of them; those emails go to ownerIdCollisions and are
+/// resolved by hand with adminGate resolveOwnerCollision.
+private func seedOwnerIds() {
+    if (ownerIdsSeeded) { return };
+    let byFold = HashMap.HashMap<Principal, Buffer.Buffer<Text>>(256, Principal.equal, Principal.hash);
+    for ((key, _) in usersByEmail.entries()) {
+        // Real verified emails only: anon keys are "ext:..." / "dev_..." with no '@'.
+        // Every session-capable key (anything but anonymous "ext:" players), not just
+        // ones containing '@': the verifier can mint sessions for any key string.
+        // Skip anything already assigned (e.g. a fresh install that took logins first).
+        if (Option.isNull(emailOwnerIds.get(key)) and not Text.startsWith(key, #text "ext:")) {
+            let p = emailToPrincipalSimple(key);
+            switch (byFold.get(p)) {
+                case (?b) { b.add(key) };
+                case null {
+                    let b = Buffer.Buffer<Text>(1);
+                    b.add(key);
+                    byFold.put(p, b);
+                };
+            };
+        };
+    };
+    let held = Buffer.Buffer<Text>(0);
+    for ((p, emails) in byFold.entries()) {
+        if (emails.size() == 1) {
+            emailOwnerIds.put(emails.get(0), p);
+        } else {
+            for (e in emails.vals()) { held.add(e) };
+        };
+    };
+    ownerIdCollisions := Buffer.toArray(held);
+    ownerIdsSeeded := true;
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // HELPER: Validate session and get owner Principal
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -10976,6 +11120,8 @@ private func sweepSessionsForEmail(email : Text) : Nat {
     toDelete.size()
 };
 
+private transient let OWNER_ID_MISSING : Text = "Developer identity unavailable for this account. Sign out and back in, or contact info@cheddaboards.com if this persists.";
+
 private func getOwnerFromSession(sessionId: Text) : Result.Result<Principal, Text> {
     switch (sessions.get(sessionId)) {
         case null { #err("Invalid or expired session") };
@@ -10985,7 +11131,10 @@ private func getOwnerFromSession(sessionId: Text) : Result.Result<Principal, Tex
                 sessions.delete(sessionId);
                 return #err("Session expired");
             };
-            #ok(emailToPrincipalSimple(session.email))
+            switch (emailOwnerIds.get(session.email)) {
+                case (?p) { #ok(p) };
+                case null { #err(OWNER_ID_MISSING) };
+            }
         };
     };
 };
@@ -11055,7 +11204,7 @@ public query func getGamesBySession(sessionId: Text) : async [GameInfo] {
     switch (getValidSession(sessionId)) {
         case null { return [] };
         case (?session) {
-            let owner = emailToPrincipalSimple(session.email);
+            let owner = ownerIdOrNobody(session.email);
             
             let ownerGames = Buffer.Buffer<GameInfo>(0);
             for ((_, game) in games.entries()) {
@@ -11078,7 +11227,7 @@ public query func getSuspicionLogBySession(sessionId: Text, gameId: Text, limit:
     switch (getValidSession(sessionId)) {
       case null { return [] };
       case (?session) {
-        let owner = emailToPrincipalSimple(session.email);
+        let owner = ownerIdOrNobody(session.email);
         
         // Verify caller owns this game
         switch (games.get(gameId)) {
@@ -11117,7 +11266,7 @@ public query func getDeletedGamesBySession(sessionId: Text) : async [DeletedGame
     switch (getValidSession(sessionId)) {
         case null { return [] };
         case (?session) {
-            let owner = emailToPrincipalSimple(session.email);
+            let owner = ownerIdOrNobody(session.email);
             
             let ownerDeleted = Buffer.Buffer<DeletedGame>(0);
             for ((_, deleted) in deletedGames.entries()) {
@@ -11139,7 +11288,7 @@ public query func getRemainingDeleteAttemptsBySession(sessionId: Text) : async N
     switch (getValidSession(sessionId)) {
         case null { return 0 };
         case (?session) {
-            let owner = emailToPrincipalSimple(session.email);
+            let owner = ownerIdOrNobody(session.email);
             getRemainingDeleteAttemptsForOwner(owner)
         };
     };
