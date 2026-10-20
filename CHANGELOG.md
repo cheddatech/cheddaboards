@@ -4,6 +4,39 @@ This changelog starts on 2026-08-18. Earlier changes weren't tracked in this
 repo, so the first entry below is a catch-up covering everything since the
 previous public update. Per-release entries begin from here.
 
+## v0.15.2 — 2026-10-20
+
+### Security — self-hosters should upgrade
+- Public game queries no longer return the real game owner. Owner principals seeded in v0.14.0 for existing accounts come from the old email byte-fold, and for addresses of 28 bytes or fewer that fold is the email itself, so a developer's login email could be read from `getGame`, `listGames` or `getActiveGames`. Those three now return a placeholder owner (`qfrx4-uqap4`) unless the caller is the owner or an admin.
+- `getGamesByOwner` now returns an empty list unless the caller is that owner or an admin. Previously anyone could fold an email and use it to check whether that person had an account and which games they owned.
+- Player data was not affected: leaderboards, scoreboards and public profiles never carried owner principals or emails.
+
+### Notes for self-hosters
+- No Candid interface changes and no migration. A normal upgrade with `--wasm-memory-persistence keep`.
+- Accounts created after v0.14.0 already have random owner IDs. Legacy owners keep their folded principal for now; re-keying them is planned.
+
+## v0.15.1 — 2026-10-15
+
+### Fixed
+- API-key score submits now update per-player stats (`totalGames`, `avgScore`, `lastPlayed`, `favoriteTime`). Previously only the session `game_end` route wrote them, so players on REST and SDK API-key integrations showed no per-player analytics. Stats are recorded only on submits that count as a play.
+
+### Notes for self-hosters
+- No Candid interface changes and no migration. Stats start accumulating from the upgrade; earlier API-key plays are not backfilled.
+
+## v0.15.0 — 2026-10-14
+
+### Changed — lower cycles cost per submit
+- `high_score` and `board_score` events are no longer appended to the in-memory analytics event buffer. Nothing read them except the admin `getRecentEvents` panel, and the old trim rebuilt the full 10,000-entry buffer on every event once it was full, so every submit allocated about 80 KB of garbage. Daily and per-player stats are still updated for every event type. Other event types are trimmed in chunks of 1,000 instead of on every add.
+- Nickname checks use an index instead of scanning every user. Previously any submit whose nickname differed from the stored one walked the whole user table.
+- A score submit now fans out only to that game's boards, using a per-game board index, instead of walking every scoreboard config on the platform.
+
+### Behaviour change
+- Nickname uniqueness is now case-insensitive: `Bob` and `bob` count as the same name. Existing players are unaffected; the check applies to new names and renames.
+
+### Notes for self-hosters
+- No Candid interface changes and no stable-state changes. Both indexes are transient and rebuilt in `postupgrade`, so the first upgrade takes slightly longer on large canisters.
+- `getRecentEvents` no longer shows score submissions.
+
 ## v0.14.0 — 2026-10-05
 
 ### Security — self-hosters should upgrade

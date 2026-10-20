@@ -265,6 +265,20 @@ persistent actor CheddaBoards {
   private transient var leaderboardLastUpdate = HashMap.HashMap<Text, Nat64>(10, Text.equal, Text.hash);
   private transient let LEADERBOARD_CACHE_TTL : Nat64 = 60_000_000_000;
   private transient var analyticsEvents = Buffer.Buffer<AnalyticsEvent>(100);
+  // transient: literal caps must not become stable (VERIFIER lesson).
+  private transient let ANALYTICS_CAP : Nat = 10_000;
+  private transient let ANALYTICS_TRIM : Nat = 1_000;
+  // CYCLES FIX (v0.15.0): nickname uniqueness index. Players.isNicknameTaken
+  // walked every user on every check, and submitScore runs that check on any
+  // submit whose nickname differs from the stored one (a REST player whose name
+  // got suffixed or fell back to Player_N paid a full user-table scan on every
+  // submit, forever). Key is the lowercased nickname; rebuilt in postupgrade,
+  // self-healing on stale entries (see isNicknameTaken).
+  private transient var nicknameIndex = HashMap.HashMap<Text, UserIdentifier>(4096, Text.equal, Text.hash);
+  // CYCLES FIX (v0.15.0): board keys per game, so a submit no longer walks every
+  // scoreboardConfig on the platform to find the game's own boards. Membership
+  // only; isActive / targeted are always re-read from scoreboardConfigs.
+  private transient var boardsByGame = HashMap.HashMap<Text, Buffer.Buffer<Text>>(128, Text.equal, Text.hash);
   private transient var dailyStats = HashMap.HashMap<Text, DailyStats>(10, Text.equal, Text.hash);
   private transient var playerStats = HashMap.HashMap<Text, PlayerStats>(10, Text.equal, Text.hash);
   private transient var apiKeys = HashMap.HashMap<Text, ApiKey>(50, Text.equal, Text.hash);
@@ -439,15 +453,27 @@ private func getDeveloperTierText(owner: Principal) : Text {
       metadata = metadata;
     };
     
-    analyticsEvents.add(event);
-    
-    if (analyticsEvents.size() > 10000) {
-      let newBuffer = Buffer.Buffer<AnalyticsEvent>(10000);
-      let startIdx : Nat = Int.abs(+analyticsEvents.size() - 10000);
-      for (i in Iter.range(startIdx, analyticsEvents.size() - 1)) {
-        newBuffer.add(analyticsEvents.get(i));
+    // CYCLES FIX (v0.15.0, Oct 2026): the two per-submit event types are not
+    // appended to the event buffer. Nothing reads the buffer except the admin
+    // getRecentEvents panel, and submitScore already writes its own dailyStats
+    // row. With the buffer pinned at 10,000 the old trim below rebuilt the whole
+    // buffer on EVERY event, so each submit allocated a fresh 10,000-slot array
+    // (~80 KB of garbage per submit at ~5k submits/day, and the GC work to clear
+    // it was charged to every update call). dailyStats / playerStats below are
+    // still updated for every event type.
+    if (eventType != "high_score" and eventType != "board_score") {
+      analyticsEvents.add(event);
+      // Trim in chunks: drop the oldest ANALYTICS_TRIM once the buffer passes
+      // ANALYTICS_CAP + ANALYTICS_TRIM, instead of rebuilding to exactly the
+      // cap on every add. Amortised cost per event is now a few bytes.
+      if (analyticsEvents.size() > ANALYTICS_CAP + ANALYTICS_TRIM) {
+        let keep = analyticsEvents.size() - ANALYTICS_TRIM;
+        let newBuffer = Buffer.Buffer<AnalyticsEvent>(keep + ANALYTICS_TRIM);
+        for (i in Iter.range(ANALYTICS_TRIM, analyticsEvents.size() - 1)) {
+          newBuffer.add(analyticsEvents.get(i));
+        };
+        analyticsEvents := newBuffer;
       };
-      analyticsEvents := newBuffer;
     };
     
     let dateStr = getDateString(event.timestamp);
@@ -545,6 +571,41 @@ private func getDeveloperTierText(owner: Principal) : Text {
   // PLAYER HELPERS (delegated to Players module)
   // ════════════════════════════════════════════════════════════════════════════
 
+  // v0.15.1: per-player stats for API-key submits (previously only the session game_end route wrote these)
+  private func recordPlayerPlay(identifier : UserIdentifier, gameId : Text, score : Nat64, t : Nat64) {
+    let playerKey = identifierToText(identifier) # ":" # gameId;
+    switch (playerStats.get(playerKey)) {
+      case (?stats) {
+        let n = stats.totalGames + 1;
+        let newAvg : Nat64 = if (score >= stats.avgScore) {
+          stats.avgScore + (score - stats.avgScore) / Nat64.fromNat(n)
+        } else {
+          stats.avgScore - (stats.avgScore - score) / Nat64.fromNat(n)
+        };
+        playerStats.put(playerKey, {
+          gameId = gameId;
+          identifier = identifier;
+          totalGames = n;
+          avgScore = newAvg;
+          playStreak = stats.playStreak;
+          lastPlayed = t;
+          favoriteTime = getTimeOfDay(t);
+        });
+      };
+      case null {
+        playerStats.put(playerKey, {
+          gameId = gameId;
+          identifier = identifier;
+          totalGames = 1;
+          avgScore = score;
+          playStreak = 1;
+          lastPlayed = t;
+          favoriteTime = getTimeOfDay(t);
+        });
+      };
+    };
+  };
+
   func identifierToText(id : UserIdentifier) : Text {
     Players.identifierToText(id)
   };
@@ -562,13 +623,45 @@ private func getDeveloperTierText(owner: Principal) : Text {
     Players.isDefaultNickname(nickname)
   };
 
+  private func nicknameKey(nickname : Text) : Text {
+    Text.toLowercase(nickname)
+  };
+
+  // Record (or move) a user's nickname in the index. Called from every path
+  // that creates a user or changes a nickname; stale entries are tolerated
+  // because isNicknameTaken re-checks the owner before trusting one.
+  private func indexNickname(user : UserProfile) {
+    nicknameIndex.put(nicknameKey(user.nickname), user.identifier);
+  };
+
+  private func rebuildNicknameIndex() {
+    nicknameIndex := HashMap.HashMap<Text, UserIdentifier>(
+      usersByEmail.size() + usersByPrincipal.size() + 64, Text.equal, Text.hash
+    );
+    for ((_, u) in usersByEmail.entries()) { indexNickname(u) };
+    for ((_, u) in usersByPrincipal.entries()) { indexNickname(u) };
+  };
+
+  // O(1) replacement for Players.isNicknameTaken (full user-table scan).
+  // An index hit is only trusted if that user still exists and still holds
+  // the name, so deletions/bans/renames never leave a name wrongly reserved.
   private func isNicknameTaken(nickname : Text, excludeIdentifier : ?UserIdentifier) : Bool {
-    Players.isNicknameTaken(
-      nickname,
-      excludeIdentifier,
-      usersByEmail.entries(),
-      usersByPrincipal.entries()
-    )
+    let key = nicknameKey(nickname);
+    switch (nicknameIndex.get(key)) {
+      case null { false };
+      case (?owner) {
+        switch (getUserByIdentifier(owner)) {
+          case null { nicknameIndex.delete(key); false };
+          case (?u) {
+            if (nicknameKey(u.nickname) != key) { nicknameIndex.delete(key); return false };
+            switch (excludeIdentifier) {
+              case (?ex) { not identifiersEqual(owner, ex) };
+              case null { true };
+            }
+          };
+        };
+      };
+    }
   };
 
   // Get an available nickname - adds _1, _2, etc. if the base name is taken
@@ -887,7 +980,8 @@ private func getDeveloperTierText(owner: Principal) : Text {
     switch (user.identifier) {
       case (#email(e)) { usersByEmail.put(e, user) };
       case (#principal(p)) { usersByPrincipal.put(p, user) };
-    }
+    };
+    indexNickname(user);
   };
 
   func countGamesByOwner(owner : Principal) : Nat {
@@ -960,6 +1054,7 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
       resetIntervalNanos = null;
     };
     scoreboardConfigs.put(allTimeKey, allTimeConfig);
+    indexBoard(gameId, allTimeKey);
     scoreboardEntries.put(allTimeKey, Buffer.Buffer<ScoreEntry>(100));
     
     // Create Weekly scoreboard (by score)
@@ -979,6 +1074,7 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
       resetIntervalNanos = null;
     };
     scoreboardConfigs.put(weeklyKey, weeklyConfig);
+    indexBoard(gameId, weeklyKey);
     scoreboardEntries.put(weeklyKey, Buffer.Buffer<ScoreEntry>(100));
     
     // Create Daily scoreboard (by score)
@@ -998,6 +1094,7 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
       resetIntervalNanos = null;
     };
     scoreboardConfigs.put(dailyKey, dailyConfig);
+    indexBoard(gameId, dailyKey);
     scoreboardEntries.put(dailyKey, Buffer.Buffer<ScoreEntry>(100));
     
     trackEventInternal(#principal(owner), gameId, "default_scoreboards_created", [
@@ -1228,11 +1325,47 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
     
     // Fan-out to this game's NON-targeted boards. Targeted (category) boards are
     // written only via submitScoreToBoard, so a plain submit never pollutes them.
-    for ((sbKey, config) in scoreboardConfigs.entries()) {
-      let isTargeted = config.targeted == ?true;
-      if (config.gameId == gameId and config.isActive and not isTargeted) {
-        writeEntryToBoard(sbKey, config, userIdentifier, nickname, score, streak, authType, t);
+    // CYCLES FIX (v0.15.0): walk only this game's board keys (boardsByGame)
+    // instead of every scoreboardConfig on the platform; config is re-read so
+    // isActive/targeted are always current.
+    for (sbKey in boardKeysForGame(gameId).vals()) {
+      switch (scoreboardConfigs.get(sbKey)) {
+        case null {};
+        case (?config) {
+          let isTargeted = config.targeted == ?true;
+          if (config.gameId == gameId and config.isActive and not isTargeted) {
+            writeEntryToBoard(sbKey, config, userIdentifier, nickname, score, streak, authType, t);
+          };
+        };
       };
+    };
+  };
+
+  // ── boardsByGame maintenance ──
+  private func boardKeysForGame(gameId : Text) : [Text] {
+    switch (boardsByGame.get(gameId)) {
+      case (?b) { Buffer.toArray(b) };
+      case null { [] };
+    }
+  };
+
+  private func indexBoard(gameId : Text, sbKey : Text) {
+    switch (boardsByGame.get(gameId)) {
+      case (?b) {
+        if (not Buffer.contains<Text>(b, sbKey, Text.equal)) { b.add(sbKey) };
+      };
+      case null {
+        let b = Buffer.Buffer<Text>(4);
+        b.add(sbKey);
+        boardsByGame.put(gameId, b);
+      };
+    };
+  };
+
+  private func rebuildBoardsByGame() {
+    boardsByGame := HashMap.HashMap<Text, Buffer.Buffer<Text>>(games.size() + 32, Text.equal, Text.hash);
+    for ((sbKey, config) in scoreboardConfigs.entries()) {
+      indexBoard(config.gameId, sbKey);
     };
   };
 
@@ -2914,6 +3047,7 @@ system func postupgrade() {
     gameWebsites := HashMap.fromIter<Text, Text>(gameWebsitesStable.vals(), 50, Text.equal, Text.hash);
     emailOwnerIds := HashMap.fromIter<Text, Principal>(emailOwnerIdsStable.vals(), 100, Text.equal, Text.hash);
     seedOwnerIds(); // one-time; no-op once ownerIdsSeeded is set
+    rebuildNicknameIndex(); // v0.15.0: O(1) nickname checks
     
     // Restore scoreboard configs - prefer V2, fallback to old
     let configSource = if (scoreboardConfigsStableV2.size() > 0) { 
@@ -2927,6 +3061,7 @@ system func postupgrade() {
     // Clear AFTER reading
     scoreboardConfigsStable := [];
     scoreboardConfigsStableV2 := [];
+    rebuildBoardsByGame(); // v0.15.0: per-game board keys for the submit fan-out
     
     // Restore scoreboard entries - prefer V2, fallback to old
     let entriesSource = if (scoreboardEntriesStableV2.size() > 0) {
@@ -4666,21 +4801,38 @@ public shared(msg) func registerGame(
     #ok(developerContacts.get(owner))
   };
 
-  public query func getGame(gameId : Text) : async ?GameInfo {
-    games.get(gameId)
+  // HARDENING (Oct 2026): legacy owner principals (seeded from
+  // emailToPrincipalSimple) contain the developer's email in plain bytes, so
+  // public queries must never return game.owner. Admins and the owner still
+  // see the real value; everyone else gets noOwner(). Candid type unchanged.
+  private func redactOwner(g : GameInfo, caller : Principal) : GameInfo {
+    if (g.owner == caller or isAdmin(caller)) { g } else { { g with owner = noOwner() } }
   };
 
-  public query func listGames() : async [GameInfo] {
-    Iter.toArray(games.vals())
+  public shared query (msg) func getGame(gameId : Text) : async ?GameInfo {
+    switch (games.get(gameId)) {
+      case (?g) { ?redactOwner(g, msg.caller) };
+      case null { null };
+    }
   };
 
-  public query func getActiveGames() : async [GameInfo] {
+  public shared query (msg) func listGames() : async [GameInfo] {
+    Iter.toArray(Iter.map(games.vals(), func (g : GameInfo) : GameInfo { redactOwner(g, msg.caller) }))
+  };
+
+  public shared query (msg) func getActiveGames() : async [GameInfo] {
     Iter.toArray(
-      Iter.filter(games.vals(), func (g : GameInfo) : Bool { g.isActive })
+      Iter.map(
+        Iter.filter(games.vals(), func (g : GameInfo) : Bool { g.isActive }),
+        func (g : GameInfo) : GameInfo { redactOwner(g, msg.caller) }
+      )
     )
   };
 
-  public query func getGamesByOwner(owner : Principal) : async [GameInfo] {
+  public shared query (msg) func getGamesByOwner(owner : Principal) : async [GameInfo] {
+    // HARDENING (Oct 2026): was an open oracle (fold any email → see if it owns
+    // games). Now only the owner itself or an admin gets results.
+    if (msg.caller != owner and not isAdmin(msg.caller)) { return [] };
     // Filter out soft-deleted (inactive) games so a deleted game stops showing in
     // the dashboard — matches getGamesBySession, which already filters isActive.
     Iter.toArray(
@@ -5347,6 +5499,7 @@ public shared func revokeApiKeyBySession(
           last_updated = now();
         };
         usersByPrincipal.put(caller, newUser);
+        indexNickname(newUser);
         
         trackEventInternal(#principal(caller), "default", "signup", [
           ("provider", "internetIdentity"),
@@ -5442,6 +5595,7 @@ public shared func revokeApiKeyBySession(
           last_updated = now();
         };
         usersByEmail.put(email, newUser);
+        indexNickname(newUser);
         
         trackEventInternal(#email(email), "default", "signup", [
           ("provider", provider),
@@ -5537,6 +5691,7 @@ public shared func revokeApiKeyBySession(
           last_updated = tNow;
         };
         usersByEmail.put(userEmail, profile);
+        indexNickname(profile);
         defaultNickname
       };
 
@@ -5916,6 +6071,7 @@ public shared func revokeApiKeyBySession(
         last_updated = t;
       };
       usersByEmail.put("ext:" # userId, newUser);
+      indexNickname(newUser);
       user := ?newUser;
       
       trackEventInternal(identifier, gameId, "external_user_created", [
@@ -6089,7 +6245,10 @@ public shared func revokeApiKeyBySession(
         };
         
         putUserByIdentifier(updatedUser);
-        if (countPlay) { markPlayCounted(u.identifier, gameId, t) };
+        if (countPlay) {
+          markPlayCounted(u.identifier, gameId, t);
+          recordPlayerPlay(u.identifier, gameId, score, t);
+        };
         
         if (scoreImproved) {
           cachedLeaderboards.delete(gameId # ":score");
@@ -6268,6 +6427,7 @@ public shared func revokeApiKeyBySession(
         last_updated = t;
       };
       usersByEmail.put("ext:" # userId, newUser);
+      indexNickname(newUser);
       user := ?newUser;
     };
 
@@ -6340,7 +6500,10 @@ public shared func revokeApiKeyBySession(
           created = u.created;
           last_updated = t;
         });
-        if (countPlay) { markPlayCounted(u.identifier, gameId, t) };
+        if (countPlay) {
+          markPlayCounted(u.identifier, gameId, t);
+          recordPlayerPlay(u.identifier, gameId, score, t);
+        };
         switch (games.get(gameId)) {
           case (?gameInfo) {
             games.put(gameId, updateGameStats(gameInfo, if (newToGame) 1 else 0, if (countPlay) 1 else 0));
@@ -7745,6 +7908,7 @@ public shared func revokeApiKeyBySession(
         };
 
         scoreboardConfigs.put(key, config);
+        indexBoard(gameId, key);
         scoreboardEntries.put(key, Buffer.Buffer<ScoreEntry>(100));
 
         trackEventInternal(#principal(owner), gameId, "scoreboard_created", [
@@ -8201,6 +8365,7 @@ public shared func revokeApiKeyBySession(
     };
 
     scoreboardConfigs.put(key, config);
+    indexBoard(gameId, key);
     scoreboardEntries.put(key, Buffer.Buffer<ScoreEntry>(100));
 
     trackEventInternal(#principal(owner), gameId, "scoreboard_created", [
@@ -11019,7 +11184,7 @@ case ("downgradeDeveloper") {
 private func emailToPrincipalSimple(email: Text) : Principal {
     let bytes = Blob.toArray(Text.encodeUtf8(email));
     var hash : [var Nat8] = Array.init<Nat8>(29, 0);
-    hash[0] := 0x04; // Self-authenticating prefix
+    hash[0] := 0x04; // Legacy fold marker (NOT self-authenticating; bytes are the email, XOR-folded)
     
     for (i in Iter.range(0, bytes.size() - 1)) {
         let idx = (i % 28) + 1;
