@@ -1,258 +1,36 @@
 # Changelog
 
-This changelog starts on 2026-08-18. Earlier changes weren't tracked in this
-repo, so the first entry below is a catch-up covering everything since the
-previous public update. Per-release entries begin from here.
+All notable changes to the CheddaBoards Godot 4 SDK will be documented in this file.
 
-## v0.15.3 — 2026-10-25
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-### Security — self-hosters should upgrade
-Found in an internal audit after the proxy was open-sourced. The matching proxy fix is v1.11.2 in cheddaboards-proxy.
-- Per-game Google and Apple credentials are retired. A developer could register their own OAuth client ID or bundle ID on a game, and the proxy accepted tokens issued for it, so a developer could mint a session for anyone who had signed in with Google or Apple on a site they controlled. The proxy now accepts only the platform's own client IDs and bundle ID, and refuses new per-game registrations. No game had per-game credentials registered at the time of the fix, and proxy logs for the past 30 days show no attempts to register them. Earlier logs are not retained.
-- The suspicion log no longer stores player identifiers. Entries could hold a player's email, principal or, on session submits, their session token, and game owners can read the log for their own games through `getSuspicionLogBySession`. Entries now store the same opaque player key used by moderation. Existing entries are rewritten automatically on upgrade, and any session token found in them is deleted. On the production canister all 92 entries were rewritten and none held a live session.
-- `migrateAnonymousToII` is now verifier-only. It merged an anonymous or API-key player into the caller's account, and deleted the original, with the player ID as the only proof of ownership.
-- `getUserProfile` with the `external` type is now verifier-only. It let anyone check whether a given player ID exists.
-- Registering or updating a game no longer adds its URL to the Internet Identity alternative-origins list. Origins are managed by admins only (`addOrigin`, `setOrigins`).
-- `updateApiKeyTier` is now admin-only. Game owners could raise their own key to a higher rate-limit tier.
-- The suspicion log is capped at 5,000 entries, and rejected `adminGate` calls are no longer written to the audit log, which let any caller append large arguments to stable state.
+This repo is the standalone home of the SDK from v2.2.5 onwards. History for v2.2.4 and earlier lives in the [cheddaboards-godot changelog](https://github.com/cheddatech/CheddaBoards-Godot/blob/main/docs/CHANGELOG.md), where the SDK previously shipped as part of the full template.
 
-### Notes for self-hosters
-- No Candid interface changes and no migration. A normal upgrade with `--wasm-memory-persistence keep`. The suspicion-log rewrite runs in `postupgrade`, is safe to repeat, and prints a summary to the canister log.
-- Your proxy must sign its query calls as the verifier (already required since v0.13.0); `external` profile lookups from anything else now return `Unauthorized`.
-- If you relied on game registration to populate `/.well-known/ii-alternative-origins`, add the origins you need with `addOrigin` instead. Existing entries are left in place.
-- Upgrade the proxy to v1.11.2 or later as well; the credential fix lives there.
+## [2.2.5] - 2026-09-01
 
-## v0.15.2 — 2026-10-20
+### Leaderboards, Direct from the Canister
 
-### Security — self-hosters should upgrade
-- Public game queries no longer return the real game owner. Owner principals seeded in v0.14.0 for existing accounts come from the old email byte-fold, and for addresses of 28 bytes or fewer that fold is the email itself, so a developer's login email could be read from `getGame`, `listGames` or `getActiveGames`. Those three now return a placeholder owner (`qfrx4-uqap4`) unless the caller is the owner or an admin.
-- `getGamesByOwner` now returns an empty list unless the caller is that owner or an admin. Previously anyone could fold an email and use it to check whether that person had an account and which games they owned.
-- Player data was not affected: leaderboards, scoreboards and public profiles never carried owner principals or emails.
-
-### Notes for self-hosters
-- No Candid interface changes and no migration. A normal upgrade with `--wasm-memory-persistence keep`.
-- Accounts created after v0.14.0 already have random owner IDs. Legacy owners keep their folded principal for now; re-keying them is planned.
-
-## v0.15.1 — 2026-10-15
-
-### Fixed
-- API-key score submits now update per-player stats (`totalGames`, `avgScore`, `lastPlayed`, `favoriteTime`). Previously only the session `game_end` route wrote them, so players on REST and SDK API-key integrations showed no per-player analytics. Stats are recorded only on submits that count as a play.
-
-### Notes for self-hosters
-- No Candid interface changes and no migration. Stats start accumulating from the upgrade; earlier API-key plays are not backfilled.
-
-## v0.15.0 — 2026-10-14
-
-### Changed — lower cycles cost per submit
-- `high_score` and `board_score` events are no longer appended to the in-memory analytics event buffer. Nothing read them except the admin `getRecentEvents` panel, and the old trim rebuilt the full 10,000-entry buffer on every event once it was full, so every submit allocated about 80 KB of garbage. Daily and per-player stats are still updated for every event type. Other event types are trimmed in chunks of 1,000 instead of on every add.
-- Nickname checks use an index instead of scanning every user. Previously any submit whose nickname differed from the stored one walked the whole user table.
-- A score submit now fans out only to that game's boards, using a per-game board index, instead of walking every scoreboard config on the platform.
-
-### Behaviour change
-- Nickname uniqueness is now case-insensitive: `Bob` and `bob` count as the same name. Existing players are unaffected; the check applies to new names and renames.
-
-### Notes for self-hosters
-- No Candid interface changes and no stable-state changes. Both indexes are transient and rebuilt in `postupgrade`, so the first upgrade takes slightly longer on large canisters.
-- `getRecentEvents` no longer shows score submissions.
-
-## v0.14.0 — 2026-10-05
-
-### Security — self-hosters should upgrade
-- The developer identity behind dashboard (session) logins is now looked up by exact email, never derived from it. Previously the owner principal for a session-registered game was computed from the login email with a byte-fold that different emails could produce the same result for, so a verified login on a crafted address could have passed the owner checks on another developer's games: config, API keys, moderation and deletion. The hole has existed since session login was introduced; the collision report on the production canister after this upgrade found 0 colliding accounts, and there is no evidence it was ever exploited. Found through external code review of the public repo.
-- Existing accounts are seeded at upgrade with the principal they already own games, tiers and contacts under, so nothing changes for current developers. New accounts get a random principal from `raw_rand` on first login.
+Backwards-compatible release. Leaderboard reads now come straight from the CheddaBoards canister over the IC HTTP gateway instead of routing through the API proxy — noticeably faster board loads with no cold-start lag, and an automatic proxy fallback so nothing gets less reliable. Also hardens the SDK's internal request dispatch against a rare race. No breaking changes, no migration required.
 
 ### Added
-- Admin command `ownerIdReport` (super admin, via `adminGate`): shows whether the seed has run, how many accounts have an owner ID, how many are missing one, and any held collisions.
-- Admin command `resolveOwnerCollision <email> [confirm]`: if two existing accounts folded to the same principal at seed time, neither is assigned and both are held. The report names them; this command hands the legacy principal to the email you pick and releases the others to get fresh IDs on their next login. Report-only without `confirm`.
 
-### Notes for self-hosters
-- No Candid interface changes and no migration: a single normal upgrade. The new owner-ID map is a stable field, which EOP accepts. Pass `--wasm-memory-persistence keep` on the upgrade.
-- Run `adminGate("ownerIdReport", [])` straight after upgrading. Expect `Accounts without an ID: 0` and `Held collisions: 0`. A held account cannot use the dashboard until you resolve it; its calls return "Developer identity unavailable for this account".
-- Take a snapshot before upgrading and keep one at a time.
+**Direct Canister Reads (`CheddaBoards.gd`)**
 
-## v0.13.0 — 2026-10-04
+- `get_scoreboard()` — and the `get_weekly_leaderboard()` / `get_daily_leaderboard()` / `get_alltime_leaderboard()` / `get_monthly_leaderboard()` helpers built on it — now fetches straight from the CheddaBoards canister (`fdvph-sqaaa-aaaap-qqc4a-cai.raw.icp0.io`), skipping the proxy hop entirely
+- The response is byte-for-byte the same shape as the proxy's, so existing `scoreboard_loaded` handlers work unchanged — same JSON, same signals, same everything from your game code's point of view
+- Direct reads are keyless and header-free: public board data only, no API key travels on this path, and web exports stay CORS-simple with no preflight
+- Writes, ranks, archive readers (`get_scoreboard_archives()`, `get_last_archived_scoreboard()`, `get_last_week_scoreboard()`, and friends), and all authenticated calls stay on the proxy unchanged
 
-### Security — self-hosters should upgrade
-- A game's API key is now revoked when the game is permanently removed, and registering a game revokes any key left over from an earlier game with the same ID. Previously the key outlived the game, so a re-registered game ID inherited the previous registration's key. Soft-deleted games keep their key, so recovering a game inside the 30-day window restores a working key.
-- `validateApiKeyQuery` is now verifier-only. It was a public query that confirmed whether a key was real and which game it belonged to.
-- Profiles can no longer be looked up from a bare email address by a direct caller. `getUserProfile` no longer accepts the `email` type at all, and the `email` type on `getGameProfile`, `getPlayerScoreboardRank`, `getPlayerRank`, `getAchievements` and `getPlayerAnalytics` is verifier-only. The `session`, `principal` and `external` types are unchanged.
-- Session-token queries now reject expired sessions. `getGameOAuthConfigBySession`, `getDeveloperTierBySession`, `getRemainingGameSlotsBySession`, `getApiKeyBySession`, `hasApiKeyBySession`, `getSessionInfo`, `getGamesBySession`, `getSuspicionLogBySession`, `getDeletedGamesBySession`, `getRemainingDeleteAttemptsBySession` and the `session` type of `getPlayerScoreboardRank` previously read the session without checking its expiry.
+**Automatic Proxy Fallback**
 
-### Added
-- Admin command `sweepOrphanApiKeys` (super admin, via `adminGate`): reports active API keys, engine tags and websites whose game no longer exists. Pass `confirm` to revoke and clear them. Report-only by default, and safe to run more than once.
-
-### Changed
-- Permanently removing a game also clears its engine tag and website.
-- The registration success message now lists all three default scoreboards: `all-time`, `weekly`, `daily`.
-
-### Notes for self-hosters
-- No Candid interface changes and no migration: a single normal upgrade, with no dfx prompt expected.
-- Your proxy must make its **query** calls signed as the verifier identity too, not only its updates. A proxy that calls `validateApiKeyQuery` anonymously will see every API key as invalid after this upgrade.
-- After upgrading, run `adminGate("sweepOrphanApiKeys", [])` to see how many keys were left behind by deleted games, then again with `["confirm"]` to revoke them.
-- If your proxy looks players up with the `email` type on the queries above, it still works when signed as the verifier. Direct or anonymous callers must use `session` or `external`.
-
-## v0.12.0 — 2026-10-04
-
-### Added
-- Engine tag per game: `setGameEngine` / `setGameEngineBySession` (game owner only) and public queries `getGameEngine` / `getGameEngines`. Accepted values are `godot4`, `godot3`, `unity`, `rest` and `other`; an empty value clears the tag.
-- Website URL per game, separate from the play link in `gameUrl`: `setGameWebsite` / `setGameWebsiteBySession` (game owner only) and public queries `getGameWebsite` / `getGameWebsites`. Same validation as `gameUrl`; an empty value clears it.
-- Optional developer contact email: `setDeveloperContact` / `setDeveloperContactBySession`, readable by its owner through `getMyDeveloperContact` / `getMyDeveloperContactBySession` and by admins through `getDeveloperContact`. It is never exposed by a public query.
-- `maxLiveBytes` in `memStats` and `GET /metrics`: the largest live heap the runtime has seen.
-
-### Changed
-- `gameUrl` is now validated on all four write paths (both register and both update methods). It must start with `https://`, be at most 200 characters, and contain no spaces, quotes, angle brackets or control characters. Leading and trailing whitespace is trimmed and an empty value clears the URL. Invalid values are rejected with an error; values stored before this release are left as they are until the next edit.
-- Expired play sessions are now swept globally whenever the session map passes 500 entries. Previously a player's stale sessions were only cleared when that same player started another session, so one-off players left sessions behind indefinitely.
-- `registerGame` (principal path) now uses the developer's tier limit for game slots, matching `registerGameBySession`, instead of a flat limit.
-- The error returned when a game with time validation on receives a score without a play session now tells the caller what to do (SDK: `start_play_session()`, REST: `POST /play-sessions/start`) instead of naming an internal method.
-
-### Fixed
-- Deleting a scoreboard now also purges that board's archived periods, on both the principal and session paths. Previously the archives were left behind.
-- The admin `removeUser` command now also removes that user's login sessions.
-
-### Removed
-- `submitScoreToScoreboard`, the legacy targeted-submit method. `submitScoreToBoard` replaces it; the legacy method also never counted towards the submission total.
-
-### Notes for self-hosters
-- This release removes one Candid method, so dfx will prompt about a breaking interface change on upgrade and should name only `submitScoreToScoreboard`. Expected; confirm it. If your proxy or any client still calls that method, move it to `submitScoreToBoard` first.
-- Single deploy, no migration. The engine, website and contact maps are new stable fields, which EOP accepts on a normal upgrade.
-- If you parse the session-required error string, note the new wording.
-- Take a snapshot before upgrading and keep one at a time (`dfx canister snapshot create --replace`).
-
-## v0.11.0 — 2026-09-30
-
-### Removed
-- The Files module has been removed: `files.mo`, the `stableFiles` stable field, the transient file list and its pre/postupgrade copies, and all 7 public file methods (including `uploadFile` and `deleteFile`). It was unused (0 files stored) and only added interface and attack surface.
-- `getSystemInfo` no longer returns `fileCount`.
-
-### Added
-- `memStats` query: reports cycles balance, memory usage and internal map sizes, for capacity monitoring.
-- `GET /metrics` on the raw domain, served directly by the canister: the same capacity figures as JSON, with warning flags when cycles fall under 5T or memory goes over 1.5 GB.
-
-### Notes for self-hosters
-- This release removes Candid methods, so dfx will prompt about a breaking interface change on upgrade. Expected; confirm it. Update any client that calls the file methods or reads `fileCount`.
-- **Existing canisters need a two-step upgrade.** EOP will not implicitly drop a stable field (error M0169). First deploy tag `v0.11.0-migration`, which includes a one-shot `migration.mo` applied via `(with migration = Migration.run)` to drop `stableFiles`, then deploy `v0.11.0`, which retires the migration. Deploying `v0.11.0` directly onto a v0.10.0 canister will be rejected. Fresh installs can go straight to `v0.11.0`.
-- Take a snapshot before upgrading. Each snapshot is a full copy of the heap, so keep one at a time (`dfx canister snapshot create --replace`) to avoid paying cycles for stale copies.
-
-## v0.10.0 — 2026-09-26
-
-### Security
-- External (API-key) player writes are now accepted only from the verifier principal. Score submits, targeted board submits, achievement unlocks and nickname changes on the `external` path can no longer be made by calling the canister directly.
-- Proxy-only entry points now require the verifier: `migrateAnonymousAccount`, `startGameSessionByApiKey`, `cancelPlaySession`.
-- `getSessionInfo`, `trackEvent` and `validateApiKey` are now verifier-only.
-- `getRecentEvents` is now admin-only; analytics events carry player identifiers and should never have been public.
-- Session tokens, play-session tokens and API keys are now generated from `raw_rand` (IC randomness) instead of timestamps and counters. Existing sessions and keys remain valid.
-
-### Fixed
-- Sessions now survive canister upgrades. `postupgrade` was restoring sessions from a transient variable, so every upgrade signed out all signed-in players and developers.
-
-### Notes for self-hosters
-- **Your proxy must make every canister call signed as the verifier identity**, including external score submits. A proxy that calls anonymously for writes will get `Unauthorized` after this upgrade.
-- New token formats: sessions are `session_` + 64 hex characters, play tokens `ps_<gameId>_` + 32 hex, API keys `cb_<gameId>_` + 32 hex. Anything that parses the old numeric formats should be updated.
-- No Candid interface changes.
-
-## v0.9.0 — 2026-09-24
-
-### Security
-- Verifier gate collapsed to a single verifier principal; the previous key is no longer accepted.
-
-### Changed
-- Moved from legacy persistence to enhanced orthogonal persistence (EOP).
-  **Self-hosters upgrading an existing canister:** this is a one-way switch. Take a snapshot first; dfx.json now builds with `--enhanced-orthogonal-persistence`.
-- Game ID validation on the principal registration path; name/description length caps; stats fixes for category-board submits; play-count de-duplication.
-
-### Added
-- HTTP board reads served directly by the canister: `GET /games/{gameId}/scoreboards/{boardId}?limit=N` on the raw domain, same JSON as the API, CORS-open.
-- Deleted board IDs can be reused; the recreated board starts with a clean archive history.
-- Expired soft-deleted games are now swept on dashboard deletes too.
-
-## v0.8.1 — 2026-08-29
-
-Sync of the public repo to production. From this release the public repo is
-updated via a git-tracked mirror of the private source, one commit per release.
-
-### Changed
-
-- Sessions now last 30 days with sliding renewal on every validated use,
-  replacing the fixed 24-hour TTL. Linked players were silently dropping off
-  boards a day after signing in because expired sessions rejected submits
-  server-side while clients still showed them as logged in.
-- Game name capped at 50 characters and description at 200; over-length values
-  are clamped on write, not rejected, so existing games keep working.
-- `registerGame` (principal path) now enforces the same game-ID rule as
-  `registerGameBySession`: lowercase letters, digits, hyphens, 3–50 characters.
-  Existing IDs that predate the rule are grandfathered.
-- `dfx.json` now published as used for real builds, including
-  `--legacy-persistence`: the live canister still runs classical persistence.
-  Migration to enhanced orthogonal persistence is planned.
+- If a direct read can't get through — a network that filters `raw.icp0.io`, a gateway hiccup, a non-JSON gateway error page — the SDK silently retries the identical request via the proxy
+- After three consecutive direct failures, the SDK stops trying direct for the rest of the session, so affected players pay the detour cost at most three times and then behave exactly like v2.2.4
+- One direct success resets the failure count
+- A genuine `"Scoreboard not found"` from the canister is treated as the real answer, not retried — the canister is the source of truth
 
 ### Fixed
 
-- Gate error on `socialLoginAndGetProfile` no longer echoes the expected
-  verifier principal.
+**Request Dispatch Race**
 
-### Security
-
-- Score, streak, and play-time validation failures now return a generic
-  "rejected by game validation rules" message to clients. Previously the
-  error echoed the configured cap or minimum duration, which let anyone
-  binary-search a game's limits. Full detail, including actual play duration,
-  is still logged owner-side in the suspicion log.
-
-### Added
-
-- `unlockAchievementBatch`: unlock many achievements for a player in a single
-  update call, returning per-ID outcomes. Replaces per-achievement calls that
-  timed out on large batches.
-
-### Docs
-
-- README: device-code login is implemented in the proxy layer, not the
-  canister. Removed reference to `anonymousLoginAndGetProfile`; documented the
-  account-linking migration functions.
-
-## v0.8.0 — 2026-08-18
-
-### Security — self-hosters should upgrade
-
-- `socialLoginAndGetProfile` is now gated on the verifier principal. Previously
-  it could be called directly on the canister, bypassing OAuth token
-  verification entirely. If you run your own instance, upgrade to this version
-  and set `VERIFIER_PRINCIPAL` to your own verifier's signing principal (see
-  README). Until you do, treat OAuth-based sessions on older deployments as
-  untrusted.
-- The verifier principal is now single-sourced (`VERIFIER_PRINCIPAL`) and
-  force-reassigned in `postupgrade()`. This matters because the actor is
-  `persistent`: top-level variables are implicitly stable and survive upgrades,
-  so editing a literal alone does not change the running value. The same
-  applies to `CONTROLLER` — set it before your first deploy.
-
-### Added
-
-- Moderation endpoints for game owners: view a board in admin mode, delete a
-  single score entry, or wipe a player's scores across all of a game's boards
-  (optionally including archives). Available in both session-auth and
-  principal-auth variants.
-- Deletion audit log (`getEntryDeletionLog`): capped, stable record of every
-  moderation action. Player identifiers are stored as hashes, never raw
-  emails or principals.
-- Submission stats: `getSubmissionStats` and `getSystemInfo` now expose the
-  running submission total; `getSystemInfo` game count now reflects active
-  games only.
-
-### Fixed
-
-- Nickname validation unified to a single rule (3–16 characters, restricted
-  charset) across registration and score-submission paths. Previously
-  different entry points enforced different lengths. Existing out-of-range
-  nicknames are grandfathered; the rule is enforced on write only.
-- Deleted games no longer linger: soft-deleted games are now filtered from
-  all owner-facing game lists, and expired soft-deletes are actually purged
-  (cleanup previously never ran and left records behind, inflating counts).
-- Score wipes reset the player's per-game profile (score, streak, play count)
-  while leaving achievements intact, and touched boards bust their caches so
-  clients see the change promptly.
-
-### Changed
-
-- Moderation read endpoints are query calls (faster, no consensus round).
-- Unauthorized calls to gated auth methods return a plain error message.
+- Internal retries now route through the SDK's request queue instead of grabbing the `HTTPRequest` node directly, `_process_next_request()` guards against double-dispatch, and a busy node requeues the request for the next idle frame instead of dropping it with an error
+- Fixes rare `HTTPRequest is processing a request` errors (and silently lost requests) when completions and queued requests landed in the same frame

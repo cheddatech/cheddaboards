@@ -997,9 +997,13 @@ private func getDeveloperTierText(owner: Principal) : Text {
           };
         };
         
-        if (rules.maxScorePerSecond > 0 and durationSecs > 0) {
-          let scorePerSecond = score / durationSecs;
-          if (scorePerSecond > rules.maxScorePerSecond) {
+        // SECURITY (v0.15.4): compare on nanoseconds in unbounded Nat. The old
+        // check floored to whole seconds and skipped durationSecs == 0, so any
+        // submit inside the first second bypassed the rate cap, and flooring
+        // let a 1.9s run claim a full second's less time than it took.
+        if (rules.maxScorePerSecond > 0) {
+          let tooFast = Nat64.toNat(score) * 1_000_000_000 > Nat64.toNat(rules.maxScorePerSecond) * Nat64.toNat(durationNanos);
+          if (tooFast) {
             return {
               isValid = false;
               playDuration = durationSecs;
@@ -7668,7 +7672,12 @@ public shared func revokeApiKeyBySession(
       // looked up from a bare email address by a direct caller.
       case ("email") { if (not isVerifier(msg.caller)) { return [] }; #email(userId) };
       case ("principal") { #principal(Principal.fromText(userId)) };
-      case ("external") { #email("ext:" # userId) };
+      case ("external") {
+        // SECURITY (v0.15.4): verifier-only, like getUserProfile in v0.15.3.
+        // A public external lookup confirms whether a guessed player ID exists.
+        if (not isVerifier(msg.caller)) { return [] };
+        #email("ext:" # userId)
+      };
       case (_) { return [] };
     };
 
@@ -8576,7 +8585,12 @@ public shared func revokeApiKeyBySession(
           case p { #principal(p) };
         };
       };
-      case ("external") { #email("ext:" # userId) };
+      case ("external") {
+        // SECURITY (v0.15.4): verifier-only, like getUserProfile in v0.15.3.
+        // A public external lookup confirms whether a guessed player ID exists.
+        if (not isVerifier(msg.caller)) { return null };
+        #email("ext:" # userId)
+      };
       case (_) { return null };
     };
 
@@ -8638,7 +8652,12 @@ public shared func revokeApiKeyBySession(
       // looked up from a bare email address by a direct caller.
       case ("email") { if (not isVerifier(msg.caller)) { return null }; #email(userId) };
       case ("principal") { #principal(Principal.fromText(userId)) };
-      case ("external") { #email("ext:" # userId) };
+      case ("external") {
+        // SECURITY (v0.15.4): verifier-only, like getUserProfile in v0.15.3.
+        // A public external lookup confirms whether a guessed player ID exists.
+        if (not isVerifier(msg.caller)) { return null };
+        #email("ext:" # userId)
+      };
       case (_) { return null };
     };
     
@@ -8801,7 +8820,12 @@ public shared func revokeApiKeyBySession(
         };
       };
       case ("principal") { #principal(Principal.fromText(userId)) };
-      case ("external") { #email("ext:" # userId) };
+      case ("external") {
+        // SECURITY (v0.15.4): verifier-only, like getUserProfile in v0.15.3.
+        // A public external lookup confirms whether a guessed player ID exists.
+        if (not isVerifier(msg.caller)) { return #err("Unauthorized: external profile lookups go through the API") };
+        #email("ext:" # userId)
+      };
       case (_) { return #err("Invalid user type") };
     };
 
@@ -8892,7 +8916,12 @@ public shared func revokeApiKeyBySession(
       // looked up from a bare email address by a direct caller.
       case ("email") { if (not isVerifier(msg.caller)) { return null }; #email(userId) };
       case ("principal") { #principal(Principal.fromText(userId)) };
-      case ("external") { #email("ext:" # userId) };
+      case ("external") {
+        // SECURITY (v0.15.4): verifier-only, like getUserProfile in v0.15.3.
+        // A public external lookup confirms whether a guessed player ID exists.
+        if (not isVerifier(msg.caller)) { return null };
+        #email("ext:" # userId)
+      };
       case (_) { return null };
     };
     
