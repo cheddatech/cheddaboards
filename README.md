@@ -33,10 +33,11 @@ This public repo is a mirror of the private source, published one commit per rel
 | Looking for | Go to |
 |-------------|-------|
 | Documentation, quick starts, REST reference | [docs.cheddaboards.com](https://docs.cheddaboards.com) |
+| The REST proxy behind api.cheddaboards.com | [cheddaboards-proxy](https://github.com/cheddatech/cheddaboards-proxy) |
 | Godot 4 add-on (4.3+) | [cheddaboards-godot-addon](https://github.com/cheddatech/cheddaboards-godot-addon), also on the [Godot Asset Store](https://store.godotengine.org/asset/cheddatech/cheddaboards) |
-| Godot 4 full game template | [CheddaBoards-Godot](https://github.com/cheddatech/CheddaBoards-Godot), also on the [Godot Asset Store](https://store.godotengine.org/asset/cheddatech/cheddaboards-template) |
+| Godot 4 full game template | [cheddaboards-godot](https://github.com/cheddatech/cheddaboards-godot), also on the [Godot Asset Store](https://store.godotengine.org/asset/cheddatech/cheddaboards-template) |
 | Godot 3.6 add-on | [cheddaboards-godot3-addon](https://github.com/cheddatech/cheddaboards-godot3-addon) |
-| Unity SDK | [CheddaBoards-Unity](https://github.com/cheddatech/CheddaBoards-Unity) |
+| Unity SDK | [cheddaboards-unity](https://github.com/cheddatech/cheddaboards-unity) |
 | A worked example | [Dodge the Creeps × CheddaBoards](https://github.com/cheddatech/cheddaboards-dodge-the-creeps) ([play it](https://cheddagames.itch.io/dodge-the-creeps-x-cheddaboards)) |
 | Service status | [status.cheddatech.com](https://status.cheddatech.com) |
 
@@ -46,7 +47,7 @@ Every SDK talks to the same REST API, so anything that can make an HTTP request 
 
 ## Architecture
 
-<img src="docs/architecture.svg" alt="Game → REST proxy (verifier) → ICP canister. The proxy verifies OAuth tokens and API keys and signs canister calls; only the verifier principal can mint sessions or write scores for API-key players. The canister is this repo; self-hosters build their own proxy." width="100%">
+<img src="docs/architecture.svg" alt="Game → REST proxy (verifier) → ICP canister. The proxy verifies OAuth tokens and API keys and signs canister calls; only the verifier principal can mint sessions or write scores for API-key players. The canister is this repo; the proxy is cheddaboards-proxy." width="100%">
 
 Games talk plain HTTPS to a thin REST proxy. The proxy checks the game's API key or the player's sign-in, then calls the canister using its own signing identity, the **verifier**. The canister stores everything and enforces the rules.
 
@@ -55,9 +56,10 @@ The trust model, in short:
 - **Writes go through the verifier.** Sign-in, session minting, and every score, achievement and nickname change for API-key players are accepted only from the verifier principal. Calling the canister directly for these returns `Unauthorized`.
 - **Signed-in developers and players act through sessions.** A session token is checked by the canister on every call, lasts 30 days, and renews on use.
 - **Board reads are public and can skip the proxy.** The canister serves scoreboards over HTTP itself (see [Direct HTTP reads](#direct-http-reads)).
-- **Lookups that could leak information are closed.** API key validation and lookups by email address are verifier-only.
+- **Lookups that could leak information are closed.** API key validation, lookups by email address and lookups by API-key player ID are verifier-only.
+- **Sign-in only trusts the platform's own OAuth credentials.** The proxy accepts Google and Apple tokens issued for its own client IDs and bundle ID, never ones a developer registers.
 
-The hosted proxy at cheddaboards.com is not in this repo. Self-hosters build their own against the Candid interface (see [Self-hosting](#self-hosting)).
+The proxy that runs api.cheddaboards.com is open source too, at [cheddaboards-proxy](https://github.com/cheddatech/cheddaboards-proxy). Self-hosters can run it or build their own against the Candid interface (see [Self-hosting](#self-hosting)).
 
 ---
 
@@ -70,11 +72,10 @@ The hosted proxy at cheddaboards.com is not in this repo. Self-hosters build the
 - **Account linking**: an anonymous profile merges into a signed-in account without losing progress. Scores and streaks merge by maximum, achievements are combined, play counts are summed
 - **Cross-game profiles**: a signed-in player keeps one identity across every CheddaBoards game
 - **Achievements**: per-player unlocks, with a batch call for unlocking many at once
-- **Anti-cheat**: per-player rate limiting, per-round and absolute score caps, optional play-session time validation, and a suspicion log the game owner can read
+- **Anti-cheat**: per-player rate limiting, per-round and absolute score caps, optional play-session time validation, and a suspicion log the game owner can read, with players shown only as opaque keys
 - **Moderation**: game owners can delete a single score entry or wipe a player from their boards, with a capped audit log that stores player identifiers as hashes
 - **Game metadata**: play URL, website, engine tag and an optional developer contact email
 - **API keys**: one key per game, generated from IC randomness, revoked automatically when a game is removed
-- **Per-game OAuth**: developers can register their own Google and Apple credentials
 - **Safe deletion**: deleted games can be recovered for 30 days before they are removed for good
 - **Operations**: a `memStats` query and a `GET /metrics` endpoint for capacity monitoring, and an admin command set for support and recovery
 
@@ -100,7 +101,7 @@ For Godot and Unity, use an SDK from the table above. Setup guides, the REST ref
 
 ## Self-hosting
 
-The canister is fully open source and you can run your own instance. It is more assembly than a one-click template: you deploy the canister, then build a small API layer in front of it. The [self-hosting guide](https://docs.cheddaboards.com/self-hosting/overview) covers the proxy side in more detail.
+The canister is fully open source and you can run your own instance. It is more assembly than a one-click template: you deploy the canister, then run an API layer in front of it, either [cheddaboards-proxy](https://github.com/cheddatech/cheddaboards-proxy) or your own. The [self-hosting guide](https://docs.cheddaboards.com/self-hosting/overview) covers the proxy side in more detail.
 
 ### Prerequisites
 
@@ -111,8 +112,8 @@ The canister is fully open source and you can run your own instance. It is more 
 ### 1. Clone
 
 ```bash
-git clone https://github.com/cheddatech/CheddaBoards.git
-cd CheddaBoards
+git clone https://github.com/cheddatech/cheddaboards.git
+cd cheddaboards
 ```
 
 ### 2. Configure principals
@@ -157,32 +158,32 @@ The canister uses enhanced orthogonal persistence (`--enhanced-orthogonal-persis
 ```bash
 dfx canister --network ic stop cheddaboards_v2_backend
 dfx canister --network ic snapshot create cheddaboards_v2_backend
-dfx canister --network ic start cheddaboards_v2_backend
 dfx deploy cheddaboards_v2_backend --network ic --mode upgrade --wasm-memory-persistence keep
+dfx canister --network ic start cheddaboards_v2_backend
 ```
 
 - **Read the changelog first.** Each release in [CHANGELOG.md](CHANGELOG.md) has notes for self-hosters. Some upgrades need two steps, and removing a stable field needs a one-shot migration.
 - **Snapshot before every upgrade.** It is your only rollback. Each snapshot is a full copy of the heap and counts towards memory and cycle burn, so keep one at a time (`snapshot create --replace <id>`) and delete it once the upgrade is proven.
 - **Check the module hash afterwards.** `dfx canister --network ic info <name>` should match the `shasum -a 256` of the wasm you built.
 
-### 5. Build your proxy
+### 5. Run a proxy
 
-Generate the Candid bindings your proxy will call:
+The simplest route is [cheddaboards-proxy](https://github.com/cheddatech/cheddaboards-proxy), the same code that runs api.cheddaboards.com. Its README covers the environment variables and deployment. To build your own instead, generate the Candid bindings it will call:
 
 ```bash
 dfx generate cheddaboards_v2_backend
 ```
 
-Your API layer translates HTTP requests into canister calls. It needs:
+Either way, your API layer translates HTTP requests into canister calls. It needs:
 
 - **A signing identity** (for example an Ed25519 keypair) whose principal you set as `VERIFIER_PRINCIPAL`. Keep the private key secret: it can mint sessions for any user and write scores for any game
 - **To sign every canister call as that identity, queries included.** External score submits, achievement unlocks, play-session starts and API key lookups are all rejected or return nothing for any other caller
 - **To validate each game's API key itself**, through `validateApiKeyQuery`, on every request. The canister trusts the proxy to have done this for API-key players, so never accept a key without asking the canister
-- **To verify OAuth tokens itself** (for example via JWKS) before calling `socialLoginAndGetProfile`
+- **To verify OAuth tokens itself** (for example via JWKS) before calling `socialLoginAndGetProfile`, and to accept only tokens issued for **your own** client IDs and bundle ID. Sessions are tied to the email, not the game, so accepting a developer-supplied audience would let that developer sign in as anyone who uses their app
 - **Rate limiting**, since the canister only applies a per-player submit throttle
 - **Your canister ID and an IC host** (`https://icp-api.io`, or `http://127.0.0.1:4943` for local dfx)
 - **OAuth client IDs** for the providers you support
-- **Allowed CORS origins** for the domains your games are served from. Avoid wildcards in production
+- **A CORS policy.** Games run on arbitrary domains, so the hosted proxy reflects the request origin; that is safe only because auth rides on headers, never cookies
 
 After upgrading to v0.13.0 or later, run `adminGate("sweepOrphanApiKeys", [])` once to report API keys left behind by deleted games, then again with `["confirm"]` to revoke them.
 
@@ -198,7 +199,7 @@ Key methods by area. Most owner-facing methods come in two forms: a principal va
 
 **Sign-in and sessions**: `socialLoginAndGetProfile`, `createSessionForVerifiedUser`, `iiLoginAndGetProfile`, `validateSession`, `destroySession`
 
-**Account linking**: `migrateAnonymousAccount`, `migrateAnonymousToII`
+**Account linking**: `migrateAnonymousAccount`, `migrateAnonymousToII` (both verifier-only)
 
 **Games**: `registerGame`, `updateGame`, `deleteGame`, `recoverDeletedGame`, `getGame`, `listGames`
 
@@ -224,7 +225,7 @@ Key methods by area. Most owner-facing methods come in two forms: a principal va
 
 > **Fan-out vs targeted:** `submitScore` writes a score to every standard board on the game (all-time, weekly, daily). `submitScoreToBoard` writes to one board only, which is how per-level and per-category boards work. A board opts in to targeted behaviour in its config.
 
-> **User ID types:** player-facing methods take a type and an ID. Use `session` with a session token, `external` with an API-key player ID, or `principal`. The `email` type is verifier-only.
+> **User ID types:** player-facing methods take a type and an ID. Use `session` with a session token, `external` with an API-key player ID, or `principal`. The `email` type is verifier-only, and so is the `external` type on `getUserProfile`.
 
 ### Direct HTTP reads
 
@@ -244,7 +245,7 @@ The production canister ID is `fdvph-sqaaa-aaaap-qqc4a-cai`.
 
 ## Security
 
-Found a vulnerability? Please email [info@cheddaboards.com](mailto:info@cheddaboards.com) instead of opening a public issue. Security fixes are listed under a **Security** heading in the changelog, and self-hosters should upgrade when one appears.
+Found a vulnerability? Please email [info@cheddaboards.com](mailto:info@cheddaboards.com) instead of opening a public issue; [SECURITY.md](SECURITY.md) has the details. Security fixes are listed under a **Security** heading in the changelog, and self-hosters should upgrade when one appears.
 
 ---
 

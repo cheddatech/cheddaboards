@@ -4,6 +4,24 @@ This changelog starts on 2026-08-18. Earlier changes weren't tracked in this
 repo, so the first entry below is a catch-up covering everything since the
 previous public update. Per-release entries begin from here.
 
+## v0.15.3 — 2026-10-25
+
+### Security — self-hosters should upgrade
+Found in an internal audit after the proxy was open-sourced. The matching proxy fix is v1.11.2 in cheddaboards-proxy.
+- Per-game Google and Apple credentials are retired. A developer could register their own OAuth client ID or bundle ID on a game, and the proxy accepted tokens issued for it, so a developer could mint a session for anyone who had signed in with Google or Apple on a site they controlled. The proxy now accepts only the platform's own client IDs and bundle ID, and refuses new per-game registrations. No game had per-game credentials registered at the time of the fix, and proxy logs for the past 30 days show no attempts to register them. Earlier logs are not retained.
+- The suspicion log no longer stores player identifiers. Entries could hold a player's email, principal or, on session submits, their session token, and game owners can read the log for their own games through `getSuspicionLogBySession`. Entries now store the same opaque player key used by moderation. Existing entries are rewritten automatically on upgrade, and any session token found in them is deleted. On the production canister all 92 entries were rewritten and none held a live session.
+- `migrateAnonymousToII` is now verifier-only. It merged an anonymous or API-key player into the caller's account, and deleted the original, with the player ID as the only proof of ownership.
+- `getUserProfile` with the `external` type is now verifier-only. It let anyone check whether a given player ID exists.
+- Registering or updating a game no longer adds its URL to the Internet Identity alternative-origins list. Origins are managed by admins only (`addOrigin`, `setOrigins`).
+- `updateApiKeyTier` is now admin-only. Game owners could raise their own key to a higher rate-limit tier.
+- The suspicion log is capped at 5,000 entries, and rejected `adminGate` calls are no longer written to the audit log, which let any caller append large arguments to stable state.
+
+### Notes for self-hosters
+- No Candid interface changes and no migration. A normal upgrade with `--wasm-memory-persistence keep`. The suspicion-log rewrite runs in `postupgrade`, is safe to repeat, and prints a summary to the canister log.
+- Your proxy must sign its query calls as the verifier (already required since v0.13.0); `external` profile lookups from anything else now return `Unauthorized`.
+- If you relied on game registration to populate `/.well-known/ii-alternative-origins`, add the origins you need with `addOrigin` instead. Existing entries are left in place.
+- Upgrade the proxy to v1.11.2 or later as well; the credential fix lives there.
+
 ## v0.15.2 — 2026-10-20
 
 ### Security — self-hosters should upgrade

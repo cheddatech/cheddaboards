@@ -30,6 +30,7 @@ import Char "mo:base/Char";
 import Timer "mo:base/Timer";
 import Cycles "mo:base/ExperimentalCycles";
 import Prim "mo:prim";
+import Debug "mo:base/Debug";
 
 import Types "types";
 import ApiKeys "apikeys";
@@ -401,13 +402,77 @@ private func getDeveloperTierText(owner: Principal) : Text {
     "session_" # toHex(randomBytes)
   };
 
-  func logSuspicion(playerId : Text, gameId : Text, reason : Text) {
+  // SECURITY (audit H4, Oct 2026): callers pass playerKeyOf(identifier),
+  // never a raw userId. On session submits the raw userId IS the session
+  // token, and game owners can read this log, so logging it handed owners
+  // live player credentials. Capped like entryDeletionLog (audit M2).
+  func logSuspicion(playerKey : Text, gameId : Text, reason : Text) {
     suspicionLog := List.push({
-      player_id = playerId;
+      player_id = playerKey;
       gameId = gameId;
       reason = reason;
       timestamp = now();
     }, suspicionLog);
+    if (List.size(suspicionLog) > MAX_SUSPICION_LOG) {
+      suspicionLog := List.take(suspicionLog, MAX_SUSPICION_LOG);
+    };
+  };
+
+  private transient let MAX_SUSPICION_LOG : Nat = 5000;
+
+  private func isAllDigits(t : Text) : Bool {
+    if (Text.size(t) == 0) { return false };
+    for (c in t.chars()) { if (not Char.isDigit(c)) { return false } };
+    true
+  };
+
+  // One-time scrub, run from postupgrade after sessions are restored.
+  // Idempotent: entries already holding a player key (all digits) are kept.
+  // Old entries were either identifierToText output ("email:..", "principal:..")
+  // or "<userId>/<userIdType>". For session/email types the userId is a live
+  // session token: resolve it to the player key, then DELETE that session,
+  // since the token was readable by the game owner.
+  private func scrubSuspicionLog() {
+    var rewritten = 0;
+    var killed = 0;
+    suspicionLog := List.map<{ player_id : Text; gameId : Text; reason : Text; timestamp : Nat64 }, { player_id : Text; gameId : Text; reason : Text; timestamp : Nat64 }>(
+      suspicionLog,
+      func(e) {
+        if (e.gameId == "SYSTEM" or isAllDigits(e.player_id)) { return e };
+        let pid = e.player_id;
+        let key : Text =
+          if (Text.startsWith(pid, #text("email:")) or Text.startsWith(pid, #text("principal:"))) {
+            Nat32.toText(Text.hash(pid))
+          } else {
+            let parts = Iter.toArray(Text.split(pid, #char '/'));
+            if (parts.size() == 2 and (parts[1] == "session" or parts[1] == "email")) {
+              switch (sessions.get(parts[0])) {
+                case (?sess) {
+                  sessions.delete(parts[0]);
+                  killed += 1;
+                  playerKeyOf(#email(sess.email))
+                };
+                case null { Nat32.toText(Text.hash(pid)) };
+              }
+            } else if (parts.size() == 2 and parts[1] == "external") {
+              playerKeyOf(#email("ext:" # parts[0]))
+            } else if (parts.size() == 2 and parts[1] == "principal") {
+              // Same text identifierToText(#principal(p)) produces, so the key
+              // matches moderation's. No Principal.fromText: it traps on bad
+              // input, and a trap here would fail the upgrade.
+              Nat32.toText(Text.hash("principal:" # parts[0]))
+            } else {
+              Nat32.toText(Text.hash(pid))
+            }
+          };
+        rewritten += 1;
+        { player_id = key; gameId = e.gameId; reason = e.reason; timestamp = e.timestamp }
+      }
+    );
+    if (List.size(suspicionLog) > MAX_SUSPICION_LOG) {
+      suspicionLog := List.take(suspicionLog, MAX_SUSPICION_LOG);
+    };
+    Debug.print("[scrubSuspicionLog] rewrote " # Nat.toText(rewritten) # " entries, deleted " # Nat.toText(killed) # " exposed sessions");
   };
 
   private func isAdmin(caller: Principal) : Bool {
@@ -1274,7 +1339,6 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
     authType : AuthType
   ) {
     let t = now();
-    let playerId = identifierToText(userIdentifier);
     
     // Get game's anti-cheat rules and validate score/streak before inserting into scoreboards
     let rules = getValidationRules(gameId);
@@ -1283,7 +1347,7 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
     switch (rules.maxScorePerRound) {
       case (?maxPerRound) {
         if (score > maxPerRound) {
-          logSuspicion(playerId, gameId, "Score per round exceeded: " # Nat64.toText(score) # " > " # Nat64.toText(maxPerRound));
+          logSuspicion(playerKeyOf(userIdentifier), gameId, "Score per round exceeded: " # Nat64.toText(score) # " > " # Nat64.toText(maxPerRound));
           return;
         };
       };
@@ -1294,7 +1358,7 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
     switch (rules.absoluteScoreCap) {
       case (?cap) {
         if (score > cap) {
-          logSuspicion(playerId, gameId, "Absolute score cap exceeded: " # Nat64.toText(score) # " > " # Nat64.toText(cap));
+          logSuspicion(playerKeyOf(userIdentifier), gameId, "Absolute score cap exceeded: " # Nat64.toText(score) # " > " # Nat64.toText(cap));
           return;
         };
       };
@@ -1305,7 +1369,7 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
     switch (rules.maxStreakDelta) {
       case (?maxDelta) {
         if (streak > maxDelta) {
-          logSuspicion(playerId, gameId, "Streak delta exceeded: " # Nat64.toText(streak) # " > " # Nat64.toText(maxDelta));
+          logSuspicion(playerKeyOf(userIdentifier), gameId, "Streak delta exceeded: " # Nat64.toText(streak) # " > " # Nat64.toText(maxDelta));
           return;
         };
       };
@@ -1316,7 +1380,7 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
     switch (rules.absoluteStreakCap) {
       case (?cap) {
         if (streak > cap) {
-          logSuspicion(playerId, gameId, "Absolute streak cap exceeded: " # Nat64.toText(streak) # " > " # Nat64.toText(cap));
+          logSuspicion(playerKeyOf(userIdentifier), gameId, "Absolute streak cap exceeded: " # Nat64.toText(streak) # " > " # Nat64.toText(cap));
           return;
         };
       };
@@ -2424,6 +2488,14 @@ public shared(msg) func migrateAnonymousToII(
 
   let caller = msg.caller;
 
+  // SECURITY (audit H2, Oct 2026): the device ID was the only proof of
+  // ownership, so any self-made principal could absorb (and delete) any
+  // anonymous or API-key player's account. Nothing legitimate calls this
+  // directly; it stays available to the verifier only.
+  if (not isVerifier(caller)) {
+    return #err("Unauthorized: migration must go through the verifier");
+  };
+
   if (Principal.isAnonymous(caller)) {
     return #err("Internet Identity authentication required");
   };
@@ -3099,6 +3171,9 @@ system func postupgrade() {
     );
     playSessionsStable := [];
 
+    // Audit H4: rewrite old suspicion entries to player keys, kill exposed sessions.
+    scrubSuspicionLog();
+
     // Bootstrap SuperAdmin. REPLACE with your admin principal before deploying.
     let firstAdmin = Principal.fromText("aaaaa-aa");
     adminRoles.put(firstAdmin, #SuperAdmin);
@@ -3579,17 +3654,9 @@ public shared(msg) func registerGame(
         // Create default scoreboards (all-time, weekly and daily)
         createDefaultScoreboards(gameId, msg.caller);
         
-        switch(gameUrl) {
-          case(?url) {
-            if (Text.startsWith(url, #text("https://"))) {
-              let exists = Buffer.contains<Text>(alternativeOrigins, url, Text.equal);
-              if (not exists) {
-                alternativeOrigins.add(url);
-              };
-            };
-          };
-          case(null) {};
-        };
+        // SECURITY (audit H3, Oct 2026): game URLs no longer go into the II
+        // alternative-origins list. Any caller could add their own site, and
+        // II caps the list at 10. Origins are admin-managed only (addOrigin).
         
         trackEventInternal(#principal(msg.caller), gameId, "game_registered", [
           ("game_name", name),
@@ -3619,51 +3686,7 @@ public shared(msg) func registerGame(
           return #err("Only game owner can update");
         };
         
-        switch(game.gameUrl) {
-          case(?oldUrl) {
-            switch(gameUrl) {
-              case(?newUrl) {
-                if (oldUrl != newUrl) {
-                  let newOrigins = Buffer.Buffer<Text>(alternativeOrigins.size());
-                  for (url in alternativeOrigins.vals()) {
-                    if (url != oldUrl) {
-                      newOrigins.add(url);
-                    };
-                  };
-                  alternativeOrigins := newOrigins;
-                  if (Text.startsWith(newUrl, #text("https://"))) {
-                    let exists = Buffer.contains<Text>(alternativeOrigins, newUrl, Text.equal);
-                    if (not exists) {
-                      alternativeOrigins.add(newUrl);
-                    };
-                  };
-                };
-              };
-              case(null) {
-                let newOrigins = Buffer.Buffer<Text>(alternativeOrigins.size());
-                for (url in alternativeOrigins.vals()) {
-                  if (url != oldUrl) {
-                    newOrigins.add(url);
-                  };
-                };
-                alternativeOrigins := newOrigins;
-              };
-            };
-          };
-          case(null) {
-            switch(gameUrl) {
-              case(?newUrl) {
-                if (Text.startsWith(newUrl, #text("https://"))) {
-                  let exists = Buffer.contains<Text>(alternativeOrigins, newUrl, Text.equal);
-                  if (not exists) {
-                    alternativeOrigins.add(newUrl);
-                  };
-                };
-              };
-              case(null) {};
-            };
-          };
-        };
+        // SECURITY (audit H3): game URL changes no longer edit II origins.
         
         let updated : GameInfo = {
           gameId = game.gameId;
@@ -5252,8 +5275,10 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
       case (?g) { g };
     };
     
-    if (game.owner != msg.caller and not isAdmin(msg.caller)) {
-      return #err("Only the game owner can update API key tier");
+    // SECURITY (audit M4): tiers set rate limits, so only admins change them.
+    ignore game;
+    if (not isAdmin(msg.caller)) {
+      return #err("Only an admin can change an API key tier");
     };
     
     if (not ApiKeys.isValidTier(newTier)) {
@@ -6029,7 +6054,7 @@ public shared func revokeApiKeyBySession(
     // Validate score and streak
     switch (validateScore(score, gameId)) {
       case (#err(e)) { 
-        logSuspicion(userId # "/" # userIdType, gameId, "Invalid score: " # e);
+        logSuspicion(playerKeyOf(identifier), gameId, "Invalid score: " # e);
         // Detail stays owner-side (anti-cheat log). Echoing the cap to the
         // client let anyone binary-search a game's limits and submit just
         // under them (INFO-LEAK fix 2026-08-21).
@@ -6040,7 +6065,7 @@ public shared func revokeApiKeyBySession(
 
     switch (validateStreak(streak, gameId)) {
       case (#err(e)) {
-        logSuspicion(userId # "/" # userIdType, gameId, "Invalid streak: " # e);
+        logSuspicion(playerKeyOf(identifier), gameId, "Invalid streak: " # e);
         return #err("Streak rejected by game validation rules");
       };
       case (#ok()) {};
@@ -6129,7 +6154,7 @@ public shared func revokeApiKeyBySession(
               if (not validation.isValid) {
                 switch (validation.reason) {
                   case (?reason) {
-                    logSuspicion(identifierToText(u.identifier), gameId, "Time validation failed: " # reason # " (played " # Nat64.toText(validation.playDuration) # "s)");
+                    logSuspicion(playerKeyOf(u.identifier), gameId, "Time validation failed: " # reason # " (played " # Nat64.toText(validation.playDuration) # "s)");
                     return #err(reason);
                   };
                   case null {
@@ -6168,7 +6193,7 @@ public shared func revokeApiKeyBySession(
               switch (rules.maxScorePerRound) {
                 case (?maxDelta) {
                   if (score - gProfile.total_score > maxDelta) {
-                    logSuspicion(identifierToText(u.identifier), gameId, "Score delta too high");
+                    logSuspicion(playerKeyOf(u.identifier), gameId, "Score delta too high");
                     return #err("Score increase too large.");
                   };
                 };
@@ -6183,7 +6208,7 @@ public shared func revokeApiKeyBySession(
               switch (rules.maxStreakDelta) {
                 case (?maxDelta) {
                   if (streak - gProfile.best_streak > maxDelta) {
-                    logSuspicion(identifierToText(u.identifier), gameId, "Streak delta too high");
+                    logSuspicion(playerKeyOf(u.identifier), gameId, "Streak delta too high");
                     return #err("Streak increase too large.");
                   };
                 };
@@ -6400,11 +6425,11 @@ public shared func revokeApiKeyBySession(
     };
 
     switch (validateScore(score, gameId)) {
-      case (#err(e)) { logSuspicion(userId # "/" # userIdType, gameId, "Invalid score: " # e); return #err("Score rejected by game validation rules") };
+      case (#err(e)) { logSuspicion(playerKeyOf(identifier), gameId, "Invalid score: " # e); return #err("Score rejected by game validation rules") };
       case (#ok()) {};
     };
     switch (validateStreak(streak, gameId)) {
-      case (#err(e)) { logSuspicion(userId # "/" # userIdType, gameId, "Invalid streak: " # e); return #err("Streak rejected by game validation rules") };
+      case (#err(e)) { logSuspicion(playerKeyOf(identifier), gameId, "Invalid streak: " # e); return #err("Streak rejected by game validation rules") };
       case (#ok()) {};
     };
 
@@ -6471,7 +6496,7 @@ public shared func revokeApiKeyBySession(
               let validation = validatePlaySession(token, u.identifier, gameId, score);
               if (not validation.isValid) {
                 switch (validation.reason) {
-                  case (?reason) { logSuspicion(identifierToText(u.identifier), gameId, "Time validation failed: " # reason # " (played " # Nat64.toText(validation.playDuration) # "s)"); return #err(reason) };
+                  case (?reason) { logSuspicion(playerKeyOf(u.identifier), gameId, "Time validation failed: " # reason # " (played " # Nat64.toText(validation.playDuration) # "s)"); return #err(reason) };
                   case null { return #err("Play session validation failed.") };
                 };
               };
@@ -8725,7 +8750,12 @@ public shared func revokeApiKeyBySession(
   // PROFILE QUERIES - Updated for external users
   // ════════════════════════════════════════════════════════════════════════════
 
-  public query func getUserProfile(userIdType : Text, userId : Text) : async Result.Result<PublicUserProfile, Text> {
+  public shared query(msg) func getUserProfile(userIdType : Text, userId : Text) : async Result.Result<PublicUserProfile, Text> {
+    // SECURITY (audit H2): "external" lookups were a free existence oracle for
+    // guessing player IDs. The proxy (verifier) is the only legitimate caller.
+    if (userIdType == "external" and not isVerifier(msg.caller)) {
+      return #err("Unauthorized: external profile lookups go through the API");
+    };
     let identifier : UserIdentifier = switch (userIdType) {
       // HARDENING (Oct 2026): the "email" type is gone. It let anyone look up a
       // profile from a bare email address. Use "session" or "external".
@@ -8965,12 +8995,13 @@ public shared func revokeApiKeyBySession(
 
   public shared(msg) func adminGate(command : Text, args : [Text]) : async Result.Result<Text, Text> {
     if (emergencyPaused and command != "emergencyUnpause") {
-      logAction(msg.caller, command, args, false, "System paused");
+      if (isAdmin(msg.caller)) { logAction(msg.caller, command, args, false, "System paused") };
       return #err("🚨 EMERGENCY PAUSE ACTIVE - All operations frozen");
     };
     
+    // SECURITY (audit M2): rejected calls are not logged. Logging them let
+    // anyone write ~2 MB of args per call into the stable audit log.
     if (not isAdmin(msg.caller)) {
-      logAction(msg.caller, command, args, false, "Unauthorized");
       return #err("⛔️ Unauthorized: Admin access only");
     };
     
