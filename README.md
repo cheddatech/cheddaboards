@@ -68,6 +68,7 @@ The proxy that runs api.cheddaboards.com is open source too, at [cheddaboards-pr
 - **Leaderboards**: server-validated scores, with all-time, weekly and daily boards created for every game
 - **Timed scoreboards**: daily, weekly, monthly and custom-interval boards that reset on calendar boundaries and archive each period
 - **Category scoreboards**: per-level, per-mode or per-category boards you submit to by ID, without registering a separate game for each
+- **Board limits**: per-game caps by developer tier, checked when a board is created: free 50 boards with at most 5 fan-out, pro 250 with at most 15. Targeted boards count only toward the total
 - **Player accounts**: anonymous players identified by device under the game's API key, plus Google, Apple and Internet Identity sign-in. Device-code login for linking a game client to an account is implemented in the hosted proxy, not in the canister
 - **Account linking**: an anonymous profile merges into a signed-in account without losing progress. Scores and streaks merge by maximum, achievements are combined, play counts are summed
 - **Cross-game profiles**: a signed-in player keeps one identity across every CheddaBoards game
@@ -76,7 +77,7 @@ The proxy that runs api.cheddaboards.com is open source too, at [cheddaboards-pr
 - **Moderation**: game owners can delete a single score entry or wipe a player from their boards, with a capped audit log that stores player identifiers as hashes
 - **Game metadata**: play URL, website, engine tag and an optional developer contact email
 - **API keys**: one key per game, generated from IC randomness, revoked automatically when a game is removed
-- **Safe deletion**: deleted games can be recovered for 30 days before they are removed for good
+- **Safe deletion**: deleted games can be recovered for 30 days, or the owner can remove one for good straight away. Permanent removal clears the game's boards, scores, archived periods and API key
 - **Operations**: a `memStats` query and a `GET /metrics` endpoint for capacity monitoring, and an admin command set for support and recovery
 
 ---
@@ -93,7 +94,7 @@ curl -X POST https://api.cheddaboards.com/scores \
   -d '{"playerId":"player_123","gameId":"your-game-id","score":1200,"streak":3}'
 ```
 
-The hosted service is free: 3 game slots to start (more on request from the dashboard), unlimited players, no per-player fees.
+The hosted service is free: 3 game slots to start (more on request from the dashboard), up to 50 boards per game, unlimited players, no per-player fees.
 
 For Godot and Unity, use an SDK from the table above. Setup guides, the REST reference and error codes are at [docs.cheddaboards.com](https://docs.cheddaboards.com). AI coding assistants can start from [docs.cheddaboards.com/llms.txt](https://docs.cheddaboards.com/llms.txt).
 
@@ -133,6 +134,8 @@ let firstAdmin = Principal.fromText("aaaaa-aa");
 ```
 
 Get your principal with `dfx identity get-principal`. A quick check before any deploy: `grep -n "aaaaa-aa" src/cheddaboards_v2_backend/main.mo` should print nothing.
+
+Board limits per game are set by the `FREE_MAX_BOARDS`, `FREE_MAX_FANOUT_BOARDS`, `PRO_MAX_BOARDS` and `PRO_MAX_FANOUT_BOARDS` constants in `main.mo`. They are `transient`, so you can change them on any upgrade.
 
 > ⚠️ **Set these before your first deploy.** The actor is `persistent`, so
 > top-level variables are stable and survive upgrades. Editing a literal
@@ -201,7 +204,7 @@ Key methods by area. Most owner-facing methods come in two forms: a principal va
 
 **Account linking**: `migrateAnonymousAccount`, `migrateAnonymousToII` (both verifier-only)
 
-**Games**: `registerGame`, `updateGame`, `deleteGame`, `recoverDeletedGame`, `getGame`, `listGames`
+**Games**: `registerGame`, `updateGame`, `deleteGame`, `recoverDeletedGame`, `permanentlyDeleteGame`, `getGame`, `listGames`
 
 **Game metadata**: `setGameEngine`, `getGameEngines`, `setGameWebsite`, `getGameWebsites`, `setDeveloperContact`, `getMyDeveloperContact`
 
@@ -209,7 +212,7 @@ Key methods by area. Most owner-facing methods come in two forms: a principal va
 
 **Scores and leaderboards**: `submitScore`, `submitScoreToBoard`, `getScoreboard`, `getScoreboardsForGame`, `getLeaderboard`, `getPlayerRank`, `getPlayerScoreboardRank`
 
-**Scoreboard management**: `createScoreboard`, `updateScoreboard`, `resetScoreboard`, `deleteScoreboard`
+**Scoreboard management**: `createScoreboard`, `updateScoreboard`, `resetScoreboard`, `deleteScoreboard`, `getBoardLimitsBySession`
 
 **Archives**: `getScoreboardArchives`, `getLastArchivedScoreboard`, `getArchivedScoreboard`
 
@@ -223,7 +226,7 @@ Key methods by area. Most owner-facing methods come in two forms: a principal va
 
 **Stats and operations**: `getSubmissionStats`, `getSystemInfo`, `memStats`, `adminGate`
 
-> **Fan-out vs targeted:** `submitScore` writes a score to every standard board on the game (all-time, weekly, daily). `submitScoreToBoard` writes to one board only, which is how per-level and per-category boards work. A board opts in to targeted behaviour in its config.
+> **Fan-out vs targeted:** `submitScore` writes a score to every fan-out board on the game: the default all-time, weekly and daily boards plus any other non-targeted board. `submitScoreToBoard` writes to one board only, which is how per-level and per-category boards work. A board opts in to targeted behaviour in its config, which is fixed at creation. Because every plain submit writes to all fan-out boards, they have their own, lower limit.
 
 > **User ID types:** player-facing methods take a type and an ID. Use `session` with a session token, `external` with an API-key player ID, or `principal`. The `email` type is verifier-only, and so is the `external` type on `getUserProfile`.
 

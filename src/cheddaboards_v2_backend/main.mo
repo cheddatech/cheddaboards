@@ -396,6 +396,61 @@ private func getDeveloperTierText(owner: Principal) : Text {
     }
 };
 
+  // ── Board limits (v0.16.0) ──
+  // Two caps per game, by the owner's tier:
+  //   total  : every active board (memory backstop; targeted per-level boards are cheap)
+  //   fanout : active non-targeted boards (every plain submit writes all of them)
+  // Checked only when a board is created, so games already over a cap keep
+  // their boards (grandfathered) but can't add more of that kind.
+  private transient let FREE_MAX_BOARDS : Nat = 50;
+  private transient let FREE_MAX_FANOUT_BOARDS : Nat = 5;
+  private transient let PRO_MAX_BOARDS : Nat = 250;
+  private transient let PRO_MAX_FANOUT_BOARDS : Nat = 15;
+
+  private func boardLimitsFor(owner : Principal) : { maxBoards : Nat; maxFanout : Nat } {
+    switch (developerTiers.get(owner)) {
+      case (?#pro) { { maxBoards = PRO_MAX_BOARDS; maxFanout = PRO_MAX_FANOUT_BOARDS } };
+      case (_) { { maxBoards = FREE_MAX_BOARDS; maxFanout = FREE_MAX_FANOUT_BOARDS } };
+    }
+  };
+
+  // Active boards for a game via the boardsByGame index (tombstones excluded).
+  private func countActiveBoards(gameId : Text) : { total : Nat; fanout : Nat } {
+    var total = 0;
+    var fanout = 0;
+    for (sbKey in boardKeysForGame(gameId).vals()) {
+      switch (scoreboardConfigs.get(sbKey)) {
+        case (?config) {
+          if (config.gameId == gameId and config.isActive) {
+            total += 1;
+            if (config.targeted != ?true) { fanout += 1 };
+          };
+        };
+        case null {};
+      };
+    };
+    { total = total; fanout = fanout }
+  };
+
+  // null = allowed; ?message = refuse.
+  private func checkBoardLimits(gameId : Text, owner : Principal, targeted : Bool) : ?Text {
+    let limits = boardLimitsFor(owner);
+    let counts = countActiveBoards(gameId);
+    let tier = getDeveloperTierText(owner);
+    if (counts.total >= limits.maxBoards) {
+      return ?("Board limit reached: this game has " # Nat.toText(counts.total) #
+        " boards and the " # tier # " tier allows " # Nat.toText(limits.maxBoards) #
+        ". Delete an unused board, or email info@cheddaboards.com if you need more.");
+    };
+    if (not targeted and counts.fanout >= limits.maxFanout) {
+      return ?("Fan-out board limit reached: this game has " # Nat.toText(counts.fanout) #
+        " fan-out boards and the " # tier # " tier allows " # Nat.toText(limits.maxFanout) #
+        ". Every plain submit writes to all of them. Create this one as a targeted board " #
+        "(per-level or per-mode, submitted to by ID), or delete an unused fan-out board.");
+    };
+    null
+  };
+
   // v0.10.0: 256 bits from raw_rand (see takeRandomBytes). Counter kept for stats.
   func generateSessionId(randomBytes : [Nat8]) : Text {
     sessionCounter += 1;
@@ -1797,7 +1852,39 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
     };
     gameEngines.delete(gameId);
     gameWebsites.delete(gameId);
+    // v0.16.0: boards used to outlive a permanently deleted game, so their
+    // entries and archives stayed in memory forever and a re-registered ID
+    // inherited the old custom boards and scores.
+    ignore purgeGameBoards(gameId);
     revoked
+  };
+
+  // Removes every board of a game: configs (incl. tombstones), live entries,
+  // read caches, archived periods and the boardsByGame index entry.
+  // Returns how many board configs were removed.
+  private func purgeGameBoards(gameId : Text) : Nat {
+    var removed = 0;
+    for (sbKey in boardKeysForGame(gameId).vals()) {
+      scoreboardConfigs.delete(sbKey);
+      scoreboardEntries.delete(sbKey);
+      cachedScoreboards.delete(sbKey);
+      scoreboardLastUpdate.delete(sbKey);
+      removed += 1;
+    };
+    boardsByGame.delete(gameId);
+
+    // One pass over archives (cheaper than purgeScoreboardArchives per board).
+    let toDelete = Buffer.Buffer<Text>(16);
+    for ((key, archive) in scoreboardArchives.entries()) {
+      if (archive.gameId == gameId) { toDelete.add(key) };
+    };
+    for (key in toDelete.vals()) { scoreboardArchives.delete(key) };
+
+    for (sortKey in ["score", "streak"].vals()) {
+      cachedLeaderboards.delete(gameId # ":" # sortKey);
+      leaderboardLastUpdate.delete(gameId # ":" # sortKey);
+    };
+    removed
   };
 
   func cleanupDeletedGames() {
@@ -1972,12 +2059,8 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
   public shared(msg) func permanentlyDeleteGame(gameId : Text) : async Result.Result<Text, Text> {
     switch (deletedGames.get(gameId)) {
       case (?deleted) {
-        let nowTime = Nat64.fromNat(Int.abs(Time.now()));
         
-        if (nowTime <= deleted.permanentDeletionAt and not isAdmin(msg.caller)) {
-          return #err("Game can only be permanently deleted after 30 days or by super admin");
-        };
-        
+        // v0.16.0: the owner no longer has to wait out the 30-day window.
         if (deleted.game.owner != msg.caller and not isAdmin(msg.caller)) {
           return #err("Not authorized");
         };
@@ -1996,7 +2079,7 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
           ]
         );
         
-        #ok("Game permanently deleted. All data has been removed.")
+        #ok("Game permanently deleted: its boards, scores, archives and API key have been removed.")
       };
       case null { #err("Game not found in deleted games") };
     }
@@ -4575,6 +4658,49 @@ public shared(msg) func registerGame(
     };
   };
 
+  // v0.16.0: owner skips the 30-day recovery window. Only for a game that is
+  // already soft-deleted (the dashboard's Deleted Games list), and the caller
+  // must repeat the game ID as confirmation. Not recoverable.
+  public shared func permanentlyDeleteGameBySession(
+    sessionId : Text,
+    gameId : Text,
+    confirmGameId : Text
+  ) : async Result.Result<Text, Text> {
+    switch (getOwnerFromSession(sessionId)) {
+      case (#err(e)) { #err(e) };
+      case (#ok(owner)) {
+        switch (deletedGames.get(gameId)) {
+          case null { #err("Deleted game not found. Delete the game first, then delete it permanently from Deleted Games.") };
+          case (?deleted) {
+            if (not Principal.equal(deleted.game.owner, owner)) {
+              return #err("You don't own this game");
+            };
+            if (confirmGameId != gameId) {
+              return #err("Confirmation didn't match. Type the game ID exactly to delete it permanently.");
+            };
+
+            games.delete(gameId);
+            deletedGames.delete(gameId);
+            ignore purgeGameRemnants(gameId); // API key, engine, website, all boards
+
+            trackEventInternal(
+              #principal(owner),
+              "system",
+              "game_permanently_deleted",
+              [
+                ("gameId", gameId),
+                ("gameName", deleted.game.name),
+                ("by", "owner")
+              ]
+            );
+
+            #ok("Game '" # deleted.game.name # "' permanently deleted: its boards, scores, archives and API key have been removed. The game ID is free to register again.")
+          };
+        };
+      };
+    };
+  };
+
   // ═══════════════════════════════════════════════════════════════════════════════
   // UPDATE updateGameStats HELPER TO INCLUDE OAUTH FIELDS
   // ═══════════════════════════════════════════════════════════════════════════════
@@ -4886,6 +5012,37 @@ public shared(msg) func registerGame(
         };
     };
 };
+
+  // v0.16.0: board counts and limits for the dashboard ("X of Y boards").
+  public query func getBoardLimitsBySession(sessionId : Text, gameId : Text) : async Result.Result<{
+    tier : Text;
+    boards : Nat;
+    maxBoards : Nat;
+    fanoutBoards : Nat;
+    maxFanoutBoards : Nat;
+  }, Text> {
+    switch (getValidSession(sessionId)) {
+      case null { #err("Invalid session") };
+      case (?session) {
+        let owner = ownerIdOrNobody(session.email);
+        switch (games.get(gameId)) {
+          case null { #err("Game not found") };
+          case (?game) {
+            if (not Principal.equal(game.owner, owner)) { return #err("You don't own this game") };
+            let limits = boardLimitsFor(owner);
+            let counts = countActiveBoards(gameId);
+            #ok({
+              tier = getDeveloperTierText(owner);
+              boards = counts.total;
+              maxBoards = limits.maxBoards;
+              fanoutBoards = counts.fanout;
+              maxFanoutBoards = limits.maxFanout;
+            })
+          };
+        };
+      };
+    };
+  };
 
 // Also add for II users:
 public query func getDeveloperTier() : async {tier: Text; maxGames: Nat; currentGames: Nat} {
@@ -7897,8 +8054,17 @@ public shared func revokeApiKeyBySession(
             if (existing.isActive) {
               return #err("Scoreboard ID already exists for this game");
             };
-            purgeScoreboardArchives(gameId, scoreboardId);
           };
+          case null {};
+        };
+
+        switch (checkBoardLimits(gameId, owner, targeted)) {
+          case (?msg) { return #err(msg) };
+          case null {};
+        };
+        // Purge a tombstone's archives only once the create is going ahead.
+        switch (scoreboardConfigs.get(key)) {
+          case (?existing) { if (not existing.isActive) { purgeScoreboardArchives(gameId, scoreboardId) } };
           case null {};
         };
 
@@ -8356,8 +8522,17 @@ public shared func revokeApiKeyBySession(
         if (existing.isActive) {
           return #err("Scoreboard ID already exists for this game");
         };
-        purgeScoreboardArchives(gameId, scoreboardId);
       };
+      case null {};
+    };
+
+    switch (checkBoardLimits(gameId, owner, targeted)) {
+      case (?msg) { return #err(msg) };
+      case null {};
+    };
+    // Purge a tombstone's archives only once the create is going ahead.
+    switch (scoreboardConfigs.get(key)) {
+      case (?existing) { if (not existing.isActive) { purgeScoreboardArchives(gameId, scoreboardId) } };
       case null {};
     };
 

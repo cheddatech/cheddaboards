@@ -4,6 +4,23 @@ This changelog starts on 2026-08-18. Earlier changes weren't tracked in this
 repo, so the first entry below is a catch-up covering everything since the
 previous public update. Per-release entries begin from here.
 
+## v0.16.0 — 2026-11-04
+
+### Added
+- Per-game board limits by developer tier, checked when a board is created. Free: 50 boards, of which at most 5 fan-out (non-targeted). Pro: 250 boards, at most 15 fan-out. Targeted boards count only toward the total, since a plain submit never writes them.
+- `getBoardLimitsBySession(sessionId, gameId)` returns the game's board and fan-out counts with the limits for the owner's tier, for "X of Y" in the dashboard.
+- `permanentlyDeleteGameBySession(sessionId, gameId, confirmGameId)` lets an owner permanently delete a game straight away instead of waiting out the 30-day recovery window. It works only on a game that is already deleted (in Deleted Games), and `confirmGameId` must repeat the game ID. `permanentlyDeleteGame` (Internet Identity) now also lets the owner skip the wait; before, only an admin could.
+
+### Fixed
+- Permanently deleting a game, by the owner, an admin or the 30-day sweep, now removes all of its boards: configs, live entries, archived periods and read caches. Previously only the game record, API key, engine tag and website were removed, so a deleted game's boards and scores stayed in memory indefinitely, and anyone who later registered the same game ID inherited its custom boards and their entries.
+
+### Notes for self-hosters
+- Existing games over a limit keep their boards; they can't add more of that kind until they're back under it.
+- Creating a board over a limit returns an error naming the limit. Recreating a deleted board's ID now leaves its archives untouched when the create is refused.
+- The limits are `transient let` constants near the top of `main.mo` (`FREE_MAX_BOARDS`, `FREE_MAX_FANOUT_BOARDS`, `PRO_MAX_BOARDS`, `PRO_MAX_FANOUT_BOARDS`), so changing them takes effect on the next upgrade.
+- The board purge applies to games permanently removed from this release on. Boards left behind by games removed earlier are not cleaned up retroactively.
+- One new query and one new update method, no other interface changes and no migration. A normal upgrade with `--wasm-memory-persistence keep`.
+
 ## v0.15.4 — 2026-10-25
 
 ### Security — self-hosters should upgrade
