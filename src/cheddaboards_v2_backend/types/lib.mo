@@ -260,6 +260,7 @@ module {
   /// Public score entry (no identifier exposed)
   public type PublicScoreEntry = {
     nickname : Text;
+    displayName : ?Text;
     score : Nat64;
     streak : Nat64;
     submittedAt : Nat64;

@@ -4,6 +4,36 @@ This changelog starts on 2026-08-18. Earlier changes weren't tracked in this
 repo, so the first entry below is a catch-up covering everything since the
 previous public update. Per-release entries begin from here.
 
+## v0.18.0 — 2026-11-25
+
+### Added
+- **International display names.** Players can now have a display name in any language as well as their nickname. The nickname doesn't change: still unique, ASCII, 3–16 characters, and the name every game can show. The display name is optional, one per account, doesn't have to be unique, and can use other scripts (Japanese, Korean, Chinese, Cyrillic, accented Latin and so on).
+- Per-game **International names** setting (`setGameIntlNames` / `setGameIntlNamesBySession`, public `getGameIntlNames`), off by default. A game only shows display names, and players can only set them from it, while it's on. Godot and Unity default fonts have no CJK glyphs, which is why games opt in.
+- `setDisplayName(userIdType, userId, gameId, ?name)`. Set, or clear with `null` / `""`. API only (verifier-gated); the API does full validation, and the canister keeps a floor of checks: 48-byte cap, no control, zero-width, bidi or private-use characters, no emoji, at most one inner space, at least one letter.
+- `getDisplayName(userIdType, userId, gameId)` returns the player's own display name, or null when the game hasn't opted in.
+- `displayName : ?Text` on `getScoreboard`, archive reads and the dashboard moderation views. The HTTP board JSON gains `"displayName"` only when it's set and the game has opted in, so responses for games with the setting off are unchanged.
+- Moderation: `resetPlayerDisplayNameBySession` / `resetPlayerDisplayName` let a game owner clear a player's display name (logged with scope `DISPLAY_NAME`). It's cleared account-wide, so the player shows their nickname everywhere until they set a new one.
+- `adminGate pruneDisplayNames` drops display names of removed accounts (also runs on every upgrade).
+
+### Changed
+- Linking an anonymous account keeps the display name. The linked account's name wins if it has one.
+- Permanently deleting a game clears its International names setting.
+
+### Notes
+- No stable record types changed: the setting and the names live in two new standalone maps.
+
+## v0.17.1 — 2026-11-06
+
+### Fixed
+- **Abandoned runs no longer lock a player out of saving scores.** A play
+  session stays open until it expires when a player quits mid-run (closes the
+  tab, kills the app), and a player could hold at most three per game, so a
+  few quits in a row meant the next run couldn't start a session and its
+  scores were rejected once time validation was on. Starting a session at the
+  limit now ends that player's oldest open session for the game instead of
+  refusing the new one. The limit itself is unchanged, so nobody can hold
+  more than three sessions at once.
+
 ## v0.17.0 — 2026-11-06
 
 ### Fixed

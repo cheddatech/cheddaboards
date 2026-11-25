@@ -313,6 +313,7 @@ module {
   public func toPublicEntry(entry : ScoreEntry, rank : Nat) : PublicScoreEntry {
     {
       nickname = entry.nickname;
+      displayName = null;
       score = entry.score;
       streak = entry.streak;
       submittedAt = entry.submittedAt;

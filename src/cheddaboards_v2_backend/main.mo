@@ -225,6 +225,10 @@ persistent actor CheddaBoards {
   // which boards a consumed play session has already posted to (token -> labels).
   private var boardCapExemptStable : [(Text, Bool)] = [];
   private var playSessionUsesStable : [(Text, [Text])] = [];
+  // v0.18.0: international display names. Per-game opt-in flag, and one
+  // display name per account keyed by identifierToText(identifier).
+  private var gameIntlNamesStable : [(Text, Bool)] = [];
+  private var displayNamesStable : [(Text, Text)] = [];
   // v0.14.0: session-path developer identity, looked up by exact email.
   private var emailOwnerIdsStable : [(Text, Principal)] = [];
   private var ownerIdsSeeded : Bool = false;
@@ -298,6 +302,8 @@ persistent actor CheddaBoards {
   private transient var gameWebsites = HashMap.HashMap<Text, Text>(50, Text.equal, Text.hash);
   private transient var boardCapExempt = HashMap.HashMap<Text, Bool>(20, Text.equal, Text.hash);
   private transient var playSessionUses = HashMap.HashMap<Text, [Text]>(100, Text.equal, Text.hash);
+  private transient var gameIntlNames = HashMap.HashMap<Text, Bool>(20, Text.equal, Text.hash);
+  private transient var displayNames = HashMap.HashMap<Text, Text>(256, Text.equal, Text.hash);
   private transient var emailOwnerIds = HashMap.HashMap<Text, Principal>(100, Text.equal, Text.hash);
   
   // Scoreboard runtime maps
@@ -943,6 +949,39 @@ private func getDeveloperTierText(owner: Principal) : Text {
         }
       };
     }
+  };
+
+  // v0.17.1: sessions a player abandoned (closed the tab, killed the app) stay
+  // open until they expire, and the per-player cap used to refuse new ones, so
+  // a few quits in a row left the next run with no session and every submit
+  // rejected. Now starting a session at the cap ends the player's oldest open
+  // sessions for that game instead. Nobody can hold more than the cap, so
+  // token hoarding is still blocked; a run in progress elsewhere only loses
+  // its session if the same player starts MAX_ACTIVE_SESSIONS_PER_PLAYER
+  // newer runs of the same game first.
+  private func evictOldestPlaySessions(identifier: UserIdentifier, gameId: Text) {
+    while (countActiveSessionsForPlayer(identifier, gameId) >= MAX_ACTIVE_SESSIONS_PER_PLAYER) {
+      let currentTime = now();
+      var oldest : ?(Text, Nat64) = null;
+      for ((token, session) in playSessions.entries()) {
+        if (identifiersEqual(session.identifier, identifier) and
+            session.gameId == gameId and
+            session.isActive and
+            currentTime < session.expiresAt) {
+          switch (oldest) {
+            case null { oldest := ?(token, session.startedAt) };
+            case (?(_, t)) { if (session.startedAt < t) { oldest := ?(token, session.startedAt) } };
+          };
+        };
+      };
+      switch (oldest) {
+        case null { return };   // count said otherwise; never loop
+        case (?(token, _)) {
+          playSessions.delete(token);
+          playSessionUses.delete(token);
+        };
+      };
+    };
   };
 
   private func countActiveSessionsForPlayer(identifier: UserIdentifier, gameId: Text) : Nat {
@@ -1903,6 +1942,7 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
     };
     gameEngines.delete(gameId);
     gameWebsites.delete(gameId);
+    gameIntlNames.delete(gameId); // v0.18.0
     // v0.16.0: boards used to outlive a permanently deleted game, so their
     // entries and archives stayed in memory forever and a re-registered ID
     // inherited the old custom boards and scores.
@@ -2583,6 +2623,9 @@ public shared(msg) func migrateAnonymousAccount(
   };
   usersByEmail.put(newEmail, updatedVerified);
 
+  // v0.18.0: carry the display name across (linked account's wins).
+  mergeDisplayName(anonIdentifier, newIdentifier);
+
   // ── Step 8: Delete the anonymous profile ──
   ignore usersByEmail.remove(anonKey);
 
@@ -2780,6 +2823,9 @@ public shared(msg) func migrateAnonymousToII(
     created = iiUser.created;
     last_updated = t;
   });
+
+  // v0.18.0: carry the display name across (II account's wins).
+  mergeDisplayName(anonIdentifier, newIdentifier);
 
   ignore usersByEmail.remove(anonKey);
 
@@ -3006,7 +3052,9 @@ private func repairMigratedStreaksInternal(dryRun : Bool) : Text {
     prunePlaySessionUses();
     playSessionUsesStable := Iter.toArray(playSessionUses.entries());
     emailOwnerIdsStable := Iter.toArray(emailOwnerIds.entries());
-    
+    gameIntlNamesStable := Iter.toArray(gameIntlNames.entries());
+    displayNamesStable := Iter.toArray(displayNames.entries());
+
     // Scoreboards - save to V2, DO NOT clear old ones
     scoreboardConfigsStableV2 := Iter.toArray(scoreboardConfigs.entries());
     // scoreboardConfigsStable - leave unchanged!
@@ -3264,6 +3312,9 @@ system func postupgrade() {
     emailOwnerIds := HashMap.fromIter<Text, Principal>(emailOwnerIdsStable.vals(), 100, Text.equal, Text.hash);
     seedOwnerIds(); // one-time; no-op once ownerIdsSeeded is set
     rebuildNicknameIndex(); // v0.15.0: O(1) nickname checks
+    gameIntlNames := HashMap.fromIter<Text, Bool>(gameIntlNamesStable.vals(), 20, Text.equal, Text.hash);
+    displayNames := HashMap.fromIter<Text, Text>(displayNamesStable.vals(), 256, Text.equal, Text.hash);
+    ignore pruneOrphanDisplayNames(); // v0.18.0: drop names of removed accounts
     
     // Restore scoreboard configs - prefer V2, fallback to old
     let configSource = if (scoreboardConfigsStableV2.size() > 0) { 
@@ -3561,13 +3612,21 @@ system func postupgrade() {
           };
 
           let sorted = Scoreboards.sortEntries(Buffer.toArray(buffer), config.sortBy);
+          let intl = intlNamesOn(gameId);
 
           label emit for (entry in sorted.vals()) {
             if (emitted >= cap) { break emit };
             if (emitted > 0) { entriesJson := entriesJson # "," };
+            // v0.18.0: displayName only appears when the game opted in AND the
+            // player has one, so flag-off responses stay byte-identical.
+            let dnJson = switch (displayNameIf(intl, entry.odentifier)) {
+              case (?dn) { "\"displayName\":\"" # escapeJson(dn) # "\"," };
+              case null { "" };
+            };
             entriesJson := entriesJson # "{"
               # "\"rank\":" # Nat.toText(emitted + 1) # ","
               # "\"nickname\":\"" # escapeJson(entry.nickname) # "\","
+              # dnJson
               # "\"score\":" # Nat64.toText(entry.score) # ","
               # "\"streak\":" # Nat64.toText(entry.streak) # ","
               # "\"authType\":\"" # authTypeToText(entry.authType) # "\","
@@ -4915,6 +4974,294 @@ public shared(msg) func registerGame(
   };
 
   // ════════════════════════════════════════════════════════════════════════════
+  // INTERNATIONAL DISPLAY NAMES (v0.18.0)
+  // The nickname stays what it was: unique, ASCII, 3-16, and the name every
+  // game can render. A display name is an optional second name per ACCOUNT:
+  // not unique, Unicode allowed, only set and only shown in games whose owner
+  // turned on "International names" (default fonts in Godot/Unity have no CJK
+  // glyphs, so a game must opt in). Games with the flag off never see it.
+  //
+  // Setting a name is verifier-only: the proxy does the real validation
+  // (NFKC, 2-16 graphemes, letters/marks/digits, single script, no emoji).
+  // The checks below are the floor in case anything else ever reaches it.
+  //
+  // Standalone maps (gameIds -> flag, identifierToText -> name), so no stable
+  // record type changes. Board entries keep only the nickname; the display
+  // name is joined in at read time, so a rename shows everywhere at once.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  // transient: literal caps must not become stable (VERIFIER lesson).
+  private transient let DISPLAY_NAME_MAX_BYTES : Nat = 48;
+  private transient let DISPLAY_NAME_MAX_CHARS : Nat = 32; // code points; proxy caps graphemes at 16
+
+  private func intlNamesOn(gameId : Text) : Bool {
+    switch (gameIntlNames.get(gameId)) { case (?true) { true }; case (_) { false } }
+  };
+
+  // Display name for a board row / profile, or null when the game hasn't
+  // opted in or the player has none. Pass the game's flag in when looping.
+  private func displayNameIf(intl : Bool, id : UserIdentifier) : ?Text {
+    if (not intl) { return null };
+    displayNames.get(identifierToText(id))
+  };
+
+  private func bustBoardCaches(gameId : Text) {
+    for (k in boardKeysForGame(gameId).vals()) {
+      cachedScoreboards.delete(k);
+      scoreboardLastUpdate.delete(k);
+    };
+  };
+
+  // Invisible, layout-breaking or spoofing characters, plus emoji (no emoji in v1).
+  private func isBlockedDisplayChar(c : Char) : Bool {
+    let n = Char.toNat32(c);
+    n < 0x20
+    or (n >= 0x7F and n <= 0x9F)      // DEL + C1 controls
+    or n == 0xA0 or n == 0xAD         // NBSP, soft hyphen
+    or n == 0x34F or n == 0x61C       // grapheme joiner, Arabic letter mark
+    or n == 0x115F or n == 0x1160     // Hangul fillers
+    or n == 0x17B4 or n == 0x17B5     // Khmer invisible vowels
+    or (n >= 0x180B and n <= 0x180F)  // Mongolian selectors / vowel separator
+    or (n >= 0x2000 and n <= 0x200F)  // odd-width spaces, zero-width, LRM/RLM
+    or (n >= 0x2028 and n <= 0x202F)  // line/para separators, bidi embeds/overrides, NNBSP
+    or (n >= 0x205F and n <= 0x206F)  // word joiner, invisible operators, bidi isolates
+    or n == 0x3000                    // ideographic space (proxy's NFKC makes it ' ')
+    or n == 0x3164 or n == 0xFFA0     // Hangul fillers
+    or (n >= 0xFE00 and n <= 0xFE0F)  // variation selectors
+    or n == 0xFEFF                    // BOM / ZWNBSP
+    or (n >= 0xFFF0 and n <= 0xFFFF)  // specials
+    or (n >= 0xE000 and n <= 0xF8FF)  // private use
+    or (n >= 0x2600 and n <= 0x27BF)  // misc symbols + dingbats (emoji)
+    or (n >= 0x1F000 and n <= 0x1FAFF) // emoji blocks
+    or (n >= 0xE0000 and n <= 0xE01EF) // tags + variation selectors supplement
+    or n >= 0xF0000                   // supplementary private use
+  };
+
+  private func validateDisplayName(name : Text) : Result.Result<(), Text> {
+    let bytes = Text.encodeUtf8(name).size();
+    if (bytes == 0) { return #err("Display name is empty") };
+    if (bytes > DISPLAY_NAME_MAX_BYTES) {
+      return #err("Display name is too long");
+    };
+    var chars : Nat = 0;
+    var letters : Nat = 0;
+    var spaces : Nat = 0;
+    var prevSpace = true; // treats a leading space as "after a space"
+    for (c in name.chars()) {
+      if (isBlockedDisplayChar(c)) {
+        return #err("Display name contains characters that aren't allowed");
+      };
+      if (c == ' ') {
+        if (prevSpace) { return #err("Display name can't start with a space or use double spaces") };
+        spaces += 1;
+        prevSpace := true;
+      } else {
+        prevSpace := false;
+      };
+      if (Char.isAlphabetic(c)) { letters += 1 };
+      chars += 1;
+    };
+    if (prevSpace) { return #err("Display name can't end with a space") };
+    if (spaces > 1) { return #err("Display name can have at most one space") };
+    if (chars > DISPLAY_NAME_MAX_CHARS) { return #err("Display name is too long") };
+    if (letters == 0) { return #err("Display name needs at least one letter") };
+    #ok(())
+  };
+
+  // Drop names whose account no longer exists (removeUser has several
+  // paths). Run from postupgrade, and on demand via adminGate.
+  private func pruneOrphanDisplayNames() : Nat {
+    if (displayNames.size() == 0) { return 0 };
+    let live = HashMap.HashMap<Text, Bool>(
+      usersByEmail.size() + usersByPrincipal.size() + 16, Text.equal, Text.hash
+    );
+    for ((_, u) in usersByEmail.entries()) { live.put(identifierToText(u.identifier), true) };
+    for ((_, u) in usersByPrincipal.entries()) { live.put(identifierToText(u.identifier), true) };
+    let orphans = Buffer.Buffer<Text>(8);
+    for ((k, _) in displayNames.entries()) {
+      if (Option.isNull(live.get(k))) { orphans.add(k) };
+    };
+    for (k in orphans.vals()) { displayNames.delete(k) };
+    orphans.size()
+  };
+
+  // On account merge: the linked account's name wins; otherwise it takes
+  // the anonymous one's. The anonymous key is always removed.
+  private func mergeDisplayName(fromId : UserIdentifier, toId : UserIdentifier) {
+    let fromKey = identifierToText(fromId);
+    let toKey = identifierToText(toId);
+    switch (displayNames.remove(fromKey)) {
+      case (?dn) {
+        if (Option.isNull(displayNames.get(toKey))) { displayNames.put(toKey, dn) };
+      };
+      case null {};
+    };
+  };
+
+  // ── Per-game flag (owner or admin) ──
+  private func setIntlNamesInternal(caller : Principal, gameId : Text, enabled : Bool) : Result.Result<Text, Text> {
+    switch (games.get(gameId)) {
+      case null { #err("Game not found") };
+      case (?game) {
+        if (not Principal.equal(game.owner, caller) and not isAdmin(caller)) {
+          return #err("Only game owner can change international names");
+        };
+        if (enabled) { gameIntlNames.put(gameId, true) } else { gameIntlNames.delete(gameId) };
+        bustBoardCaches(gameId);
+        #ok(if (enabled) { "International names on" } else { "International names off" })
+      };
+    }
+  };
+
+  public shared(msg) func setGameIntlNames(gameId : Text, enabled : Bool) : async Result.Result<Text, Text> {
+    if (Principal.isAnonymous(msg.caller)) { return #err("Anonymous callers cannot change game settings") };
+    setIntlNamesInternal(msg.caller, gameId, enabled)
+  };
+
+  public shared func setGameIntlNamesBySession(sessionId : Text, gameId : Text, enabled : Bool) : async Result.Result<Text, Text> {
+    switch (getOwnerFromSession(sessionId)) {
+      case (#err(e)) { #err(e) };
+      case (#ok(owner)) { setIntlNamesInternal(owner, gameId, enabled) };
+    }
+  };
+
+  public query func getGameIntlNames(gameId : Text) : async Bool {
+    intlNamesOn(gameId)
+  };
+
+  // Resolve the player behind a session / external ID (same rules as
+  // changeNicknameAndGetProfile, minus the principal path: this is
+  // verifier-only, so there's no player principal to check).
+  private func displayNameIdentifier(userIdType : Text, userId : Text) : Result.Result<UserIdentifier, Text> {
+    switch (userIdType) {
+      case ("session" or "email") {
+        switch (validateSessionInternal(userId)) {
+          case (#err(e)) { #err(e) };
+          case (#ok(session)) { #ok(#email(session.email)) };
+        }
+      };
+      case ("external") { #ok(#email("ext:" # userId)) };
+      case (_) { #err("Invalid user type") };
+    }
+  };
+
+  /// Set (?name) or clear (null or ?"") the player's display name.
+  /// The player must already exist (same as nicknames: the proxy holds a
+  /// pending name for a brand-new player and applies it after the first submit).
+  public shared(msg) func setDisplayName(
+    userIdType : Text,
+    userId : Text,
+    gameId : Text,
+    displayName : ?Text
+  ) : async Result.Result<{ displayName : ?Text; nickname : Text }, Text> {
+    if (not isVerifier(msg.caller)) {
+      return #err("Unauthorized: display names must be set through the API");
+    };
+    switch (validateCaller(msg, userIdType, userId)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(_)) {};
+    };
+    switch (games.get(gameId)) {
+      case null { return #err("Game not found") };
+      case (?g) { if (not g.isActive) { return #err("Game is not active") } };
+    };
+    if (not intlNamesOn(gameId)) {
+      return #err("International names are not enabled for this game");
+    };
+    let identifier = switch (displayNameIdentifier(userIdType, userId)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(id)) { id };
+    };
+    let user = switch (getUserByIdentifier(identifier)) {
+      case null { return #err("User not found") };
+      case (?u) { u };
+    };
+    let key = identifierToText(identifier);
+
+    let newName : ?Text = switch (displayName) {
+      case null { null };
+      case (?n) { if (n == "") { null } else { ?n } };
+    };
+    switch (newName) {
+      case null { displayNames.delete(key) };
+      case (?n) {
+        switch (validateDisplayName(n)) {
+          case (#err(e)) { return #err(e) };
+          case (#ok(_)) {};
+        };
+        displayNames.put(key, n);
+      };
+    };
+
+    // Bust every game this player has a profile in (the name is per account).
+    bustBoardCaches(gameId);
+    for ((gId, _) in user.gameProfiles.vals()) { bustBoardCaches(gId) };
+
+    // Deliberately no name in the event metadata (Unicode text, rare event).
+    trackEventInternal(identifier, gameId, "display_name_changed", [
+      ("cleared", if (Option.isNull(newName)) { "true" } else { "false" })
+    ]);
+
+    #ok({ displayName = newName; nickname = user.nickname })
+  };
+
+  /// The player's own display name, as seen from this game (null if the game
+  /// hasn't opted in). Verifier-only for external IDs, via validateCaller.
+  public shared query(msg) func getDisplayName(
+    userIdType : Text,
+    userId : Text,
+    gameId : Text
+  ) : async Result.Result<?Text, Text> {
+    switch (validateCaller(msg, userIdType, userId)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(_)) {};
+    };
+    let identifier = switch (displayNameIdentifier(userIdType, userId)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(id)) { id };
+    };
+    #ok(displayNameIf(intlNamesOn(gameId), identifier))
+  };
+
+  // ── Moderation: owner resets a player's display name ──
+  // Clears it account-wide (there's only one), so the player shows as their
+  // handle everywhere until they set a new one. Logged in the deletion log
+  // with scope DISPLAY_NAME.
+  private func resetDisplayNameInternal(owner : Principal, gameId : Text, playerKey : Text) : Result.Result<Text, Text> {
+    switch (resolveEntryByPlayerKey(gameId, playerKey)) {
+      case null { #err("No entries found for that player in this game") };
+      case (?e) {
+        switch (displayNames.remove(identifierToText(e.odentifier))) {
+          case null { #err("That player has no display name") };
+          case (?_) {
+            bustBoardCaches(gameId);
+            logEntryDeletion(owner, gameId, "DISPLAY_NAME", playerKey, e.nickname, 0, 0, false);
+            #ok("Display name cleared for " # e.nickname)
+          };
+        }
+      };
+    }
+  };
+
+  public shared func resetPlayerDisplayNameBySession(
+    sessionId : Text,
+    gameId : Text,
+    playerKey : Text
+  ) : async Result.Result<Text, Text> {
+    switch (ownerForGameFromSession(sessionId, gameId)) {
+      case (#err(e)) { #err(e) };
+      case (#ok(owner)) { resetDisplayNameInternal(owner, gameId, playerKey) };
+    }
+  };
+
+  public shared(msg) func resetPlayerDisplayName(gameId : Text, playerKey : Text) : async Result.Result<Text, Text> {
+    switch (requireGameOwner(msg.caller, gameId)) {
+      case (#err(e)) { #err(e) };
+      case (#ok(_)) { resetDisplayNameInternal(msg.caller, gameId, playerKey) };
+    }
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
   // BOARD CAP EXEMPTION (v0.17.0) — standalone map, not a ScoreboardConfig change.
   // Score caps and maxScorePerSecond are game-wide, which breaks boards that
   // encode something other than points (a speedrun board sending
@@ -5258,11 +5605,13 @@ public query func getScoreboardArchives(
         
         let publicEntries = Buffer.Buffer<PublicScoreEntry>(cap);
         var rank : Nat = 1;
-        
+        let intl = intlNamesOn(archive.gameId);
+
         for (entry in sortedEntries.vals()) {
           if (rank <= cap) {
             publicEntries.add({
               nickname = entry.nickname;
+              displayName = displayNameIf(intl, entry.odentifier);
               score = entry.score;
               streak = entry.streak;
               submittedAt = entry.submittedAt;
@@ -5327,11 +5676,13 @@ public query func getScoreboardArchives(
             
             let publicEntries = Buffer.Buffer<PublicScoreEntry>(cap);
             var rank : Nat = 1;
-            
+            let intl = intlNamesOn(gameId);
+
             for (entry in archive.entries.vals()) {
               if (rank <= cap) {
                 publicEntries.add({
                   nickname = entry.nickname;
+                  displayName = displayNameIf(intl, entry.odentifier);
                   score = entry.score;
                   streak = entry.streak;
                   submittedAt = entry.submittedAt;
@@ -7066,6 +7417,7 @@ public shared func revokeApiKeyBySession(
   ) : async Result.Result<[{
     playerKey : Text;
     nickname : Text;
+    displayName : ?Text;
     score : Nat64;
     streak : Nat64;
     submittedAt : Nat64;
@@ -7087,6 +7439,7 @@ public shared func revokeApiKeyBySession(
         let out = Buffer.Buffer<{
           playerKey : Text;
           nickname : Text;
+          displayName : ?Text;
           score : Nat64;
           streak : Nat64;
           submittedAt : Nat64;
@@ -7094,10 +7447,12 @@ public shared func revokeApiKeyBySession(
           rank : Nat;
         }>(entries.size());
         var rank : Nat = 1;
+        let intl = intlNamesOn(gameId);
         for (e in entries.vals()) {
           out.add({
             playerKey = playerKeyOf(e.odentifier);
             nickname = e.nickname;
+            displayName = displayNameIf(intl, e.odentifier);
             score = e.score;
             streak = e.streak;
             submittedAt = e.submittedAt;
@@ -7227,6 +7582,7 @@ public shared func revokeApiKeyBySession(
   ) : async Result.Result<[{
     playerKey : Text;
     nickname : Text;
+    displayName : ?Text;
     score : Nat64;
     streak : Nat64;
     submittedAt : Nat64;
@@ -7248,6 +7604,7 @@ public shared func revokeApiKeyBySession(
         let out = Buffer.Buffer<{
           playerKey : Text;
           nickname : Text;
+          displayName : ?Text;
           score : Nat64;
           streak : Nat64;
           submittedAt : Nat64;
@@ -7255,10 +7612,12 @@ public shared func revokeApiKeyBySession(
           rank : Nat;
         }>(entries.size());
         var rank : Nat = 1;
+        let intl = intlNamesOn(gameId);
         for (e in entries.vals()) {
           out.add({
             playerKey = playerKeyOf(e.odentifier);
             nickname = e.nickname;
+            displayName = displayNameIf(intl, e.odentifier);
             score = e.score;
             streak = e.streak;
             submittedAt = e.submittedAt;
@@ -7385,10 +7744,8 @@ public shared func revokeApiKeyBySession(
     cleanupExpiredPlaySessions(identifier, gameId);
     sweepExpiredPlaySessionsIfLarge();
     
-    let activeCount = countActiveSessionsForPlayer(identifier, gameId);
-    if (activeCount >= MAX_ACTIVE_SESSIONS_PER_PLAYER) {
-      return #err("Too many active sessions. Finish or wait for current sessions to expire.");
-    };
+    // v0.17.1: at the cap, a new run supersedes the player's oldest open one
+    evictOldestPlaySessions(identifier, gameId);
     
     let currentTime = now();
     let rules = getTimeValidationRules(gameId);
@@ -7436,10 +7793,8 @@ public shared func revokeApiKeyBySession(
     cleanupExpiredPlaySessions(identifier, gameId);
     sweepExpiredPlaySessionsIfLarge();
     
-    let activeCount = countActiveSessionsForPlayer(identifier, gameId);
-    if (activeCount >= MAX_ACTIVE_SESSIONS_PER_PLAYER) {
-      return #err("Too many active sessions. Finish or wait for current sessions to expire.");
-    };
+    // v0.17.1: at the cap, a new run supersedes the player's oldest open one
+    evictOldestPlaySessions(identifier, gameId);
     
     let currentTime = now();
     let rules = getTimeValidationRules(gameId);
@@ -7469,7 +7824,7 @@ public shared func revokeApiKeyBySession(
   ) : async Result.Result<Text, Text> {
     // v0.10.0: proxy-only (API keys are checked at the proxy).
     if (not isVerifier(msg.caller)) {
-      return #err("Unauthorized: play sessions must be started through the API");
+     return #err("Unauthorized: play sessions must be started through the API");
     };
     
     // Validate API key
@@ -7510,10 +7865,8 @@ public shared func revokeApiKeyBySession(
     cleanupExpiredPlaySessions(identifier, gameId);
     sweepExpiredPlaySessionsIfLarge();
     
-    let activeCount = countActiveSessionsForPlayer(identifier, gameId);
-    if (activeCount >= MAX_ACTIVE_SESSIONS_PER_PLAYER) {
-      return #err("Too many active sessions. Finish or wait for current sessions to expire.");
-    };
+    // v0.17.1: at the cap, a new run supersedes the player's oldest open one
+    evictOldestPlaySessions(identifier, gameId);
     
     let currentTime = now();
     let rules = getTimeValidationRules(gameId);
@@ -8411,9 +8764,11 @@ public shared func revokeApiKeyBySession(
         // Convert to public entries with rank
         let publicEntries = Buffer.Buffer<PublicScoreEntry>(sorted.size());
         var rank : Nat = 1;
+        let intl = intlNamesOn(gameId);
         for (entry in sorted.vals()) {
           publicEntries.add({
             nickname = entry.nickname;
+            displayName = displayNameIf(intl, entry.odentifier);
             score = entry.score;
             streak = entry.streak;
             submittedAt = entry.submittedAt;
@@ -11090,6 +11445,16 @@ case ("getDeveloperGames") {
       // longer in the games map at all (soft-deleted games are still in the map,
       // so their keys are left alone). No args = report only; "confirm" applies.
       // Idempotent: a second confirmed run finds nothing.
+      case ("pruneDisplayNames") {
+        // v0.18.0: drop display names whose account was removed.
+        if (not hasPermission(msg.caller, #SuperAdmin)) {
+          #err("🔒 Permission denied: SuperAdmin role required")
+        } else {
+          let n = pruneOrphanDisplayNames();
+          #ok("Pruned " # Nat.toText(n) # " orphan display name(s); " # Nat.toText(displayNames.size()) # " remain. International-names games: " # Nat.toText(gameIntlNames.size()))
+        }
+      };
+
       case ("sweepOrphanApiKeys") {
         if (not hasPermission(msg.caller, #SuperAdmin)) {
           #err("🔒 Permission denied: SuperAdmin role required")
@@ -11527,6 +11892,7 @@ case ("downgradeDeveloper") {
             "\n⚠️ Dangerous (SuperAdmin)\n" #
             "  • permanentDelete <userId>\n" #
             "  • repairMigratedStreaks [true|false]  (true=dry-run, default true)\n" #
+            "  • pruneDisplayNames  (drop display names of removed accounts)\n" #
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
             "Roles: SuperAdmin > Moderator > Support > ReadOnly")
       };
@@ -11898,5 +12264,103 @@ private func purgePlayerFromScoreboards(searchType: Text, searchValue: Text, gam
     removedCount
 };
 
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // ADMIN RECOVERY: rebuild an all-time board from player game profiles,
+  // for when a dev has deleted their boards by mistake.
+  // Deleting a board wipes its entries and archives, but each player's
+  // gameProfile keeps their best score/streak from fan-out submits, which is
+  // exactly what a fan-out all-time board holds. Entries are written with the
+  // player's real identifier, so their next submit updates the same row
+  // instead of adding a duplicate.
+  // Safe to re-run: writeEntryToBoard keeps the higher score per player.
+  // ════════════════════════════════════════════════════════════════════════════
+  public shared(msg) func adminRestoreAllTimeFromProfiles(
+    gameId : Text,
+    scoreboardId : Text,
+    dryRun : Bool
+  ) : async Result.Result<Text, Text> {
+    if (not isAdmin(msg.caller)) {
+      return #err("Only admin can restore boards");
+    };
+
+    let sbKey = makeScoreboardKey(gameId, scoreboardId);
+    let config = switch (scoreboardConfigs.get(sbKey)) {
+      case null { return #err("Board not found. Recreate it first.") };
+      case (?c) { c };
+    };
+    if (not config.isActive) {
+      return #err("Board is deleted. Recreate it first.");
+    };
+    switch (config.period) {
+      case (#allTime) {};
+      case (_) { return #err("Only all-time boards can be restored from profiles") };
+    };
+
+    var restored : Nat = 0;
+    var skippedZero : Nat = 0;
+    var lines = "";
+
+    func restoreUser(u : UserProfile) {
+      for ((gId, gp) in u.gameProfiles.vals()) {
+        if (gId == gameId) {
+          if (gp.total_score == 0 and gp.best_streak == 0) {
+            skippedZero += 1;
+          } else {
+            lines := lines # u.nickname # " " # Nat64.toText(gp.total_score)
+                     # " / " # Nat64.toText(gp.best_streak) # "\n";
+            if (not dryRun) {
+              // Re-read config each write: writeEntryToBoard may update it.
+              let current = switch (scoreboardConfigs.get(sbKey)) {
+                case (?c) { c };
+                case null { config };
+              };
+              writeEntryToBoard(sbKey, current, u.identifier, u.nickname,
+                gp.total_score, gp.best_streak, u.authType, gp.last_played);
+            };
+            restored += 1;
+          };
+        };
+      };
+    };
+
+    for ((_, u) in usersByEmail.entries()) { restoreUser(u) };
+    for ((_, u) in usersByPrincipal.entries()) { restoreUser(u) };
+
+    #ok((if (dryRun) "DRY RUN, nothing written. " else "Restored. ")
+        # Nat.toText(restored) # " entries to " # gameId # "/" # scoreboardId
+        # " (" # Nat.toText(skippedZero) # " zero profiles skipped)\n" # lines)
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // ADMIN RECOVERY: recreate a game's three default boards (all-time, weekly, daily)
+  // with the exact defaults registerGame uses (names, descriptions,
+  // maxEntries 1000, fan-out). For a dev who deleted their boards: the admin
+  // can't use createScoreboard (owner-only), and createScoreboard's defaults
+  // differ (maxEntries 100, empty description).
+  // Refuses if ANY of the three is still active, because createDefaultScoreboards
+  // replaces entries with an empty buffer.
+  // ════════════════════════════════════════════════════════════════════════════
+  public shared(msg) func adminRecreateDefaultBoards(gameId : Text) : async Result.Result<Text, Text> {
+    if (not isAdmin(msg.caller)) {
+      return #err("Only admin can recreate boards");
+    };
+    let game = switch (games.get(gameId)) {
+      case null { return #err("Game not found") };
+      case (?g) { g };
+    };
+    for (id in ["all-time", "weekly", "daily"].vals()) {
+      switch (scoreboardConfigs.get(makeScoreboardKey(gameId, id))) {
+        case (?c) {
+          if (c.isActive) {
+            return #err("Board '" # id # "' is still active. Nothing changed.");
+          };
+        };
+        case null {};
+      };
+    };
+    createDefaultScoreboards(gameId, game.owner);
+    #ok("Recreated all-time, weekly and daily for " # gameId)
+  };
 
 }
