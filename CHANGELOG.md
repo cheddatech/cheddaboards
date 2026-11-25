@@ -4,6 +4,34 @@ This changelog starts on 2026-08-18. Earlier changes weren't tracked in this
 repo, so the first entry below is a catch-up covering everything since the
 previous public update. Per-release entries begin from here.
 
+## v0.17.0 — 2026-11-06
+
+### Fixed
+- **One play session now covers a whole run across several boards.** A play
+  session used to be marked used by the first submit, so with time validation
+  on, any run that posted to more than one board (a main submit plus a
+  targeted board, or several targeted boards) had every submit after the
+  first rejected with "Session already used". A session now records which
+  boards it has posted to: it can post once to each board in the run, and
+  still never twice to the same board. The main fan-out submit counts as one
+  board. Used sessions are marked inactive exactly as before, so the
+  three-active-sessions limit and session cleanup are unchanged.
+
+### Added
+- **Targeted boards can skip the game's score caps.** Score caps and the
+  score-per-second limit are game-wide, which rejects every entry on a board
+  that stores something other than points, such as a speedrun board that
+  sends a large time-based number. A game owner can now exempt a targeted
+  board: its submits skip the per-round score cap, the absolute score cap and
+  the score-per-second check. Streak caps, the minimum play time and every
+  play-session check still apply. Fan-out boards can't be exempted.
+  - `setBoardCapExempt(gameId, scoreboardId, exempt)` and
+    `setBoardCapExemptBySession(sessionId, gameId, scoreboardId, exempt)`
+    (owner or admin).
+  - `getBoardCapExemptions(gameId)` (public query) lists exempt board IDs.
+  - Deleting a board, or permanently deleting its game, clears its exemption,
+    so a recreated board with the same ID starts with caps on.
+
 ## v0.16.0 — 2026-11-04
 
 ### Added

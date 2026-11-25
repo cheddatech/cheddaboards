@@ -221,6 +221,10 @@ persistent actor CheddaBoards {
   private var gameEnginesStable : [(Text, Text)] = [];
   private var developerContactsStable : [(Principal, Text)] = [];
   private var gameWebsitesStable : [(Text, Text)] = [];
+  // v0.17.0: targeted boards that skip the score caps (board key -> true), and
+  // which boards a consumed play session has already posted to (token -> labels).
+  private var boardCapExemptStable : [(Text, Bool)] = [];
+  private var playSessionUsesStable : [(Text, [Text])] = [];
   // v0.14.0: session-path developer identity, looked up by exact email.
   private var emailOwnerIdsStable : [(Text, Principal)] = [];
   private var ownerIdsSeeded : Bool = false;
@@ -292,6 +296,8 @@ persistent actor CheddaBoards {
   private transient var gameEngines = HashMap.HashMap<Text, Text>(50, Text.equal, Text.hash);
   private transient var developerContacts = HashMap.HashMap<Principal, Text>(10, Principal.equal, Principal.hash);
   private transient var gameWebsites = HashMap.HashMap<Text, Text>(50, Text.equal, Text.hash);
+  private transient var boardCapExempt = HashMap.HashMap<Text, Bool>(20, Text.equal, Text.hash);
+  private transient var playSessionUses = HashMap.HashMap<Text, [Text]>(100, Text.equal, Text.hash);
   private transient var emailOwnerIds = HashMap.HashMap<Text, Principal>(100, Text.equal, Text.hash);
   
   // Scoreboard runtime maps
@@ -985,13 +991,22 @@ private func getDeveloperTierText(owner: Principal) : Text {
       };
     };
     for (key in keysToRemove.vals()) { playSessions.delete(key) };
+    prunePlaySessionUses();
   };
 
+  // v0.17.0: boardLabel is the board this submit writes to (MAIN_SUBMIT_LABEL
+  // for submitScore's fan-out). A consumed session may still post once to each
+  // board it hasn't posted to, so one run can land on several boards; it can
+  // never post to the same board twice. skipRateCheck is set for targeted
+  // boards the owner exempted from score caps: only maxScorePerSecond is
+  // skipped, every other check still runs.
   private func validatePlaySession(
     sessionToken: Text,
     identifier: UserIdentifier,
     gameId: Text,
-    score: Nat64
+    score: Nat64,
+    boardLabel: Text,
+    skipRateCheck: Bool
   ) : TimeValidationResult {
     let currentTime = now();
     
@@ -1021,10 +1036,19 @@ private func getDeveloperTierText(owner: Principal) : Text {
         };
         
         if (not session.isActive) {
-          return {
-            isValid = false;
-            playDuration = 0;
-            reason = ?"Session already used. Start a new game.";
+          // Consumed by an earlier submit of this run? Then only a board it
+          // hasn't posted to yet is allowed. Cancelled sessions are deleted,
+          // so an inactive session with no use record is a used-up one.
+          let usable = switch (playSessionUses.get(sessionToken)) {
+            case null { false };
+            case (?labels) { not labelIn(labels, boardLabel) };
+          };
+          if (not usable) {
+            return {
+              isValid = false;
+              playDuration = 0;
+              reason = ?"Session already used. Start a new game.";
+            };
           };
         };
         
@@ -1056,7 +1080,7 @@ private func getDeveloperTierText(owner: Principal) : Text {
         // check floored to whole seconds and skipped durationSecs == 0, so any
         // submit inside the first second bypassed the rate cap, and flooring
         // let a 1.9s run claim a full second's less time than it took.
-        if (rules.maxScorePerSecond > 0) {
+        if (rules.maxScorePerSecond > 0 and not skipRateCheck) {
           let tooFast = Nat64.toNat(score) * 1_000_000_000 > Nat64.toNat(rules.maxScorePerSecond) * Nat64.toNat(durationNanos);
           if (tooFast) {
             return {
@@ -1076,7 +1100,34 @@ private func getDeveloperTierText(owner: Principal) : Text {
     }
   };
 
-  private func consumePlaySession(sessionToken: Text) {
+  private transient let MAIN_SUBMIT_LABEL : Text = "*main*";   // board IDs can't contain '*'
+
+  private func labelIn(labels : [Text], wanted : Text) : Bool {
+    for (l in labels.vals()) { if (l == wanted) { return true } };
+    false
+  };
+
+  // Use records for sessions that no longer exist are dead weight; dropped on
+  // the traffic-triggered sweep and before upgrades.
+  private func prunePlaySessionUses() {
+    let dead = Buffer.Buffer<Text>(20);
+    for (token in playSessionUses.keys()) {
+      if (Option.isNull(playSessions.get(token))) { dead.add(token) };
+    };
+    for (token in dead.vals()) { playSessionUses.delete(token) };
+  };
+
+  // Marks the session used (isActive = false, exactly as before, so the
+  // active-session cap and every cleanup path behave the same) and records
+  // which board this submit wrote to.
+  private func consumePlaySession(sessionToken: Text, boardLabel: Text) {
+    let used = switch (playSessionUses.get(sessionToken)) {
+      case null { [] };
+      case (?labels) { labels };
+    };
+    if (not labelIn(used, boardLabel)) {
+      playSessionUses.put(sessionToken, Array.append(used, [boardLabel]));
+    };
     switch (playSessions.get(sessionToken)) {
       case null {};
       case (?session) {
@@ -1866,6 +1917,7 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
     var removed = 0;
     for (sbKey in boardKeysForGame(gameId).vals()) {
       scoreboardConfigs.delete(sbKey);
+      boardCapExempt.delete(sbKey);
       scoreboardEntries.delete(sbKey);
       cachedScoreboards.delete(sbKey);
       scoreboardLastUpdate.delete(sbKey);
@@ -2950,6 +3002,9 @@ private func repairMigratedStreaksInternal(dryRun : Bool) : Text {
     gameEnginesStable := Iter.toArray(gameEngines.entries());
     developerContactsStable := Iter.toArray(developerContacts.entries());
     gameWebsitesStable := Iter.toArray(gameWebsites.entries());
+    boardCapExemptStable := Iter.toArray(boardCapExempt.entries());
+    prunePlaySessionUses();
+    playSessionUsesStable := Iter.toArray(playSessionUses.entries());
     emailOwnerIdsStable := Iter.toArray(emailOwnerIds.entries());
     
     // Scoreboards - save to V2, DO NOT clear old ones
@@ -3204,6 +3259,8 @@ system func postupgrade() {
     gameEngines := HashMap.fromIter<Text, Text>(gameEnginesStable.vals(), 50, Text.equal, Text.hash);
     developerContacts := HashMap.fromIter<Principal, Text>(developerContactsStable.vals(), 10, Principal.equal, Principal.hash);
     gameWebsites := HashMap.fromIter<Text, Text>(gameWebsitesStable.vals(), 50, Text.equal, Text.hash);
+    boardCapExempt := HashMap.fromIter<Text, Bool>(boardCapExemptStable.vals(), 20, Text.equal, Text.hash);
+    playSessionUses := HashMap.fromIter<Text, [Text]>(playSessionUsesStable.vals(), 100, Text.equal, Text.hash);
     emailOwnerIds := HashMap.fromIter<Text, Principal>(emailOwnerIdsStable.vals(), 100, Text.equal, Text.hash);
     seedOwnerIds(); // one-time; no-op once ownerIdsSeeded is set
     rebuildNicknameIndex(); // v0.15.0: O(1) nickname checks
@@ -4858,6 +4915,75 @@ public shared(msg) func registerGame(
   };
 
   // ════════════════════════════════════════════════════════════════════════════
+  // BOARD CAP EXEMPTION (v0.17.0) — standalone map, not a ScoreboardConfig change.
+  // Score caps and maxScorePerSecond are game-wide, which breaks boards that
+  // encode something other than points (a speedrun board sending
+  // CAP - milliseconds submits millions). An owner can exempt a TARGETED board:
+  // its submits skip maxScorePerRound / absoluteScoreCap / maxScorePerSecond,
+  // but keep the streak caps, min play duration and every play-session check.
+  // Fan-out boards can't be exempted: they're written by submitScore, whose
+  // caps protect the game's main boards.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  private func isBoardCapExempt(sbKey : Text) : Bool {
+    switch (boardCapExempt.get(sbKey)) { case (?true) { true }; case (_) { false } }
+  };
+
+  private func setBoardCapExemptInternal(caller : Principal, gameId : Text, scoreboardId : Text, exempt : Bool) : Result.Result<Text, Text> {
+    switch (games.get(gameId)) {
+      case null { return #err("Game not found") };
+      case (?game) {
+        if (not Principal.equal(game.owner, caller) and not isAdmin(caller)) {
+          return #err("Only game owner can change board caps");
+        };
+      };
+    };
+    let sbKey = makeScoreboardKey(gameId, scoreboardId);
+    if (not exempt) {
+      boardCapExempt.delete(sbKey);
+      return #ok("Score caps apply to '" # scoreboardId # "' again");
+    };
+    switch (scoreboardConfigs.get(sbKey)) {
+      case null { #err("Scoreboard not found") };
+      case (?config) {
+        if (not config.isActive) { return #err("Scoreboard not found") };
+        if (config.targeted != ?true) {
+          return #err("Only targeted boards can skip score caps");
+        };
+        boardCapExempt.put(sbKey, true);
+        #ok("'" # scoreboardId # "' now skips score caps (streak caps and play-session checks still apply)")
+      };
+    }
+  };
+
+  public shared(msg) func setBoardCapExempt(gameId : Text, scoreboardId : Text, exempt : Bool) : async Result.Result<Text, Text> {
+    if (Principal.isAnonymous(msg.caller)) { return #err("Anonymous callers cannot change board caps") };
+    setBoardCapExemptInternal(msg.caller, gameId, scoreboardId, exempt)
+  };
+
+  public shared func setBoardCapExemptBySession(sessionId : Text, gameId : Text, scoreboardId : Text, exempt : Bool) : async Result.Result<Text, Text> {
+    switch (getOwnerFromSession(sessionId)) {
+      case (#err(e)) { #err(e) };
+      case (#ok(owner)) { setBoardCapExemptInternal(owner, gameId, scoreboardId, exempt) };
+    }
+  };
+
+  // Board IDs of a game's active targeted boards that skip score caps.
+  // Safe to expose: it's a board setting, not player or owner data.
+  public query func getBoardCapExemptions(gameId : Text) : async [Text] {
+    let out = Buffer.Buffer<Text>(4);
+    for (sbKey in boardKeysForGame(gameId).vals()) {
+      if (isBoardCapExempt(sbKey)) {
+        switch (scoreboardConfigs.get(sbKey)) {
+          case (?c) { if (c.isActive and c.targeted == ?true) { out.add(c.scoreboardId) } };
+          case null {};
+        };
+      };
+    };
+    Buffer.toArray(out)
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
   // WEBSITE URL (release A) — optional, gameId -> https URL. Separate from
   // gameUrl, which is the PLAY link; several devs had put their site there.
   // Same standalone-map pattern as the engine tag. Safe to expose publicly.
@@ -6311,7 +6437,7 @@ public shared func revokeApiKeyBySession(
               return #err("This game has time validation on. Start a play session first (SDK: start_play_session(), REST: POST /play-sessions/start) and send its token with the score.");
             };
             case (?token) {
-              let validation = validatePlaySession(token, u.identifier, gameId, score);
+              let validation = validatePlaySession(token, u.identifier, gameId, score, MAIN_SUBMIT_LABEL, false);
               if (not validation.isValid) {
                 switch (validation.reason) {
                   case (?reason) {
@@ -6323,8 +6449,9 @@ public shared func revokeApiKeyBySession(
                   };
                 };
               };
-              // Valid session - consume it so it can't be reused
-              consumePlaySession(token);
+              // Valid session - consume it for the main boards so it can't be
+              // reused there (targeted boards of the same run may still use it)
+              consumePlaySession(token, MAIN_SUBMIT_LABEL);
             };
           };
         };
@@ -6585,9 +6712,15 @@ public shared func revokeApiKeyBySession(
       };
     };
 
-    switch (validateScore(score, gameId)) {
-      case (#err(e)) { logSuspicion(playerKeyOf(identifier), gameId, "Invalid score: " # e); return #err("Score rejected by game validation rules") };
-      case (#ok()) {};
+    // v0.17.0: an owner-exempted targeted board (e.g. a speedrun board that
+    // sends CAP - milliseconds) skips the score caps and the score-per-second
+    // check. Streak caps and every session check still apply.
+    let capExempt = isBoardCapExempt(sbKey);
+    if (not capExempt) {
+      switch (validateScore(score, gameId)) {
+        case (#err(e)) { logSuspicion(playerKeyOf(identifier), gameId, "Invalid score: " # e); return #err("Score rejected by game validation rules") };
+        case (#ok()) {};
+      };
     };
     switch (validateStreak(streak, gameId)) {
       case (#err(e)) { logSuspicion(playerKeyOf(identifier), gameId, "Invalid streak: " # e); return #err("Streak rejected by game validation rules") };
@@ -6654,14 +6787,14 @@ public shared func revokeApiKeyBySession(
               return #err("This game has time validation on. Start a play session first (SDK: start_play_session(), REST: POST /play-sessions/start) and send its token with the score.");
             };
             case (?token) {
-              let validation = validatePlaySession(token, u.identifier, gameId, score);
+              let validation = validatePlaySession(token, u.identifier, gameId, score, scoreboardId, capExempt);
               if (not validation.isValid) {
                 switch (validation.reason) {
                   case (?reason) { logSuspicion(playerKeyOf(u.identifier), gameId, "Time validation failed: " # reason # " (played " # Nat64.toText(validation.playDuration) # "s)"); return #err(reason) };
                   case null { return #err("Play session validation failed.") };
                 };
               };
-              consumePlaySession(token);
+              consumePlaySession(token, scoreboardId);
             };
           };
         };
@@ -8399,7 +8532,9 @@ public shared func revokeApiKeyBySession(
             };
             scoreboardConfigs.put(key, updated);
             
-            // Clear entries, read cache, and this board's archived periods
+            // Clear entries, read cache, and this board's archived periods.
+            // A recreated board with this ID starts with caps on (v0.17.0).
+            boardCapExempt.delete(key);
             scoreboardEntries.delete(key);
             cachedScoreboards.delete(key);
             scoreboardLastUpdate.delete(key);
@@ -8659,6 +8794,7 @@ public shared func revokeApiKeyBySession(
           resetIntervalNanos = config.resetIntervalNanos;
         };
         scoreboardConfigs.put(key, updated);
+        boardCapExempt.delete(key);
         scoreboardEntries.delete(key);
         cachedScoreboards.delete(key);
         scoreboardLastUpdate.delete(key);
